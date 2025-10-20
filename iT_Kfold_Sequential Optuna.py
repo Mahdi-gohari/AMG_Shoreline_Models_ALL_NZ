@@ -266,6 +266,7 @@ def main():
     WINDOW_SIZE = 90
     EPOCHS = 200
     K_FOLDS = 5
+    NUM_THREADS = 4  # Number of parallel threads for Optuna
 
     print("Starting shoreline prediction model with Optuna...")
 
@@ -278,11 +279,23 @@ def main():
         X_train_seq, y_train_seq, train_date_seq = create_sequences(X_train, y_train, train_dates, WINDOW_SIZE)
         X_test_seq, y_test_seq, test_date_seq = create_sequences(X_test, y_test, test_dates, WINDOW_SIZE)
 
+    # DB for multi-threading
+    storage_name = "sqlite:///AMG_shoreline.db" 
+    study_name = "multithread_study"
+
+    study = optuna.create_study(
+        storage=storage_name, 
+        study_name=study_name, 
+        load_if_exists=True,
+        direction='minimize'
+    )
+
     # Run Optuna optimization
-    study = optuna.create_study(direction='minimize')
+    #study = optuna.create_study(direction='minimize')
     study.optimize(
         lambda trial: objective(trial, X_train_seq, y_train_seq, X_test_seq, y_test_seq, train_date_seq, test_date_seq, y_scaler),
-        n_trials=50
+        n_trials=50,
+        n_jobs=NUM_THREADS
     )
 
     # Print best hyperparameters
