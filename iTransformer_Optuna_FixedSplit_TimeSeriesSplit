@@ -1,0 +1,508 @@
+# OTAMA_iTransformer_Optuna_FixedSplit_TimeSeriesSplit_NoParallel_withPlots.py
+# ----------------------------------------------------
+# HPO  → 75% train / 25% validation (fixed split)
+# Final → TimeSeriesSplit CV on training data (no leakage)
+# No parallelism, pandas bug fixed
+# TWO PLOTS: Time series + metrics (your exact version)
+# ----------------------------------------------------
+
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+import logging
+logging.getLogger('tensorflow').setLevel(logging.WARNING)
+
+import tensorflow as tf
+tf.debugging.set_log_device_placement(False)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import random
+import sys
+from contextlib import contextmanager
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import TimeSeriesSplit
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Dense, Dropout, LayerNormalization,
+    MultiHeadAttention, Add, Layer, GaussianNoise, Flatten
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, Callback
+from tensorflow.keras.regularizers import l2
+
+import optuna
+
+# ----------------------------------------------------------------------
+# 1. Helper utilities
+# ----------------------------------------------------------------------
+@contextmanager
+def suppress_output():
+    null = 'nul' if os.name == 'nt' else '/dev/null'
+    with open(null, 'w') as fnull:
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = fnull, fnull
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+def transform_direction(theta):
+    theta = np.array(theta) % 360
+    psi = np.where(theta <= 180, 1 - theta / 180, (theta - 180) / 180)
+    return psi
+
+
+class WarmUpCosineDecay(Callback):
+    def __init__(self, initial_lr, warmup_epochs, total_epochs, steps_per_epoch):
+        super().__init__()
+        self.initial_lr = initial_lr
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.steps_per_epoch = steps_per_epoch
+        self.global_step = 0
+        self.history = {}
+
+    def on_batch_end(self, batch, logs=None):
+        self.global_step += 1
+        cur_epoch = self.global_step // self.steps_per_epoch
+
+        if cur_epoch < self.warmup_epochs:
+            lr = self.initial_lr * (self.global_step /
+                                   (self.warmup_epochs * self.steps_per_epoch))
+        else:
+            progress = (self.global_step - self.warmup_epochs * self.steps_per_epoch) / \
+                       ((self.total_epochs - self.warmup_epochs) * self.steps_per_epoch)
+            lr = self.initial_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
+
+        self.model.optimizer.learning_rate.assign(lr)
+        self.history.setdefault('lr', []).append(lr)
+
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    random.seed(seed)
+    tf.random.set_seed(seed)
+
+
+set_seed(42)
+
+
+# ----------------------------------------------------------------------
+# 2. Data loading & preprocessing
+# ----------------------------------------------------------------------
+def load_and_preprocess_data(filepath):
+    data = pd.read_csv(filepath, parse_dates=['dates', 'real_dates'])
+    data['month'] = data['dates'].dt.month
+    data['month_sin'] = np.sin(2 * np.pi * data['month'] / 12)
+    data['month_cos'] = np.cos(2 * np.pi * data['month'] / 12)
+
+    data = data.dropna(subset=['Hs', 'Tp', 'Dir', 'Eng', 'shore'])
+    data['Dir_transformed'] = transform_direction(data['Dir'])
+    data = data.dropna(subset=['Dir_transformed'])
+
+    # Split BEFORE any rolling operations
+    train = data[data['dates'].dt.year <= 2020].copy()
+    test  = data[data['dates'].dt.year > 2020].copy()
+
+    # Optional: add rolling features safely (per split)
+    for df in [train, test]:
+        for col, win in [('Hs', 7), ('Hs', 30), ('Tp', 7), ('Tp', 30),
+                         ('Dir', 7), ('Dir', 30), ('Eng', 7), ('Eng', 30)]:
+            df[f"{col}_ma_{win}"] = df[col].rolling(win, min_periods=1).mean()
+
+    feats = ['Hs', 'Tp', 'Eng', 'month_cos', 'month_sin', 'Dir_transformed']
+    target = 'shore'
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(train[feats])
+    X_test  = scaler.transform(test[feats])
+
+    y_scaler = StandardScaler()
+    y_train = y_scaler.fit_transform(train[[target]]).flatten()
+    y_test  = y_scaler.transform(test[[target]]).flatten()
+
+    return (X_train, X_test, y_train, y_test,
+            train['dates'].values, test['dates'].values,
+            train['real_dates'].values, test['real_dates'].values,
+            scaler, y_scaler)
+
+
+# ----------------------------------------------------------------------
+# 3. Sequence creation
+# ----------------------------------------------------------------------
+def create_sequences(X, y, dates, real_dates, window_size=60):
+    X_seq, y_seq, d_seq, r_seq = [], [], [], []
+    for i in range(len(X) - window_size):
+        X_seq.append(X[i:i + window_size])
+        y_seq.append(y[i + window_size])
+        d_seq.append(dates[i + window_size])
+        r_seq.append(real_dates[i + window_size])
+    return np.array(X_seq), np.array(y_seq), np.array(d_seq), np.array(r_seq)
+
+
+# ----------------------------------------------------------------------
+# 4. Custom layer
+# ----------------------------------------------------------------------
+class TransposeLayer(Layer):
+    def __init__(self, perm, **kwargs):
+        super().__init__(**kwargs)
+        self.perm = perm
+    def call(self, inputs):
+        return tf.transpose(inputs, perm=self.perm)
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"perm": self.perm})
+        return cfg
+
+
+# ----------------------------------------------------------------------
+# 5. iTransformer model builder
+# ----------------------------------------------------------------------
+def build_transformer(input_shape,
+                      num_heads=4, ff_dim=64, num_layers=2,
+                      dropout=0.3, l2_lambda=0.05, noise_std=0.1):
+    inputs = Input(shape=input_shape)
+    x = GaussianNoise(stddev=noise_std)(inputs, training=True)
+    x = TransposeLayer(perm=[0, 2, 1])(x)
+
+    def pos_enc(length, d_model):
+        pos = np.arange(length)[:, None]
+        i   = np.arange(d_model)[None, :]
+        angle = pos / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
+        angle[:, 0::2] = np.sin(angle[:, 0::2])
+        angle[:, 1::2] = np.cos(angle[:, 1::2])
+        return tf.cast(angle[None, ...], tf.float32)
+
+    x = x + pos_enc(input_shape[1], input_shape[0])
+
+    for _ in range(num_layers):
+        attn = MultiHeadAttention(num_heads=num_heads, key_dim=input_shape[0],
+                                  dropout=dropout)(x, x)
+        x = Add()([x, attn])
+        x = LayerNormalization(epsilon=1e-6)(x)
+        x = Dropout(dropout)(x)
+
+        ff = Dense(ff_dim, activation='relu',
+                   kernel_regularizer=l2(l2_lambda))(x)
+        ff = Dense(input_shape[0],
+                   kernel_regularizer=l2(l2_lambda))(ff)
+        x = Add()([x, ff])
+        x = LayerNormalization(epsilon=1e-6)(x)
+        x = Dropout(dropout)(x)
+
+    x = TransposeLayer(perm=[0, 2, 1])(x)
+    x = Flatten()(x)
+    x = Dense(32, activation='relu',
+              kernel_regularizer=l2(l2_lambda))(x)
+    x = Dropout(dropout)(x)
+    outputs = Dense(1)(x)
+    return Model(inputs, outputs)
+
+
+# ----------------------------------------------------------------------
+# 6. Optuna objective – 75 % / 25 % fixed split (single process)
+# ----------------------------------------------------------------------
+def objective(trial,
+              X_tr_seq, y_tr_seq,
+              X_val_seq, y_val_seq,
+              window_size, feature_dim):
+
+    num_heads  = trial.suggest_categorical('num_heads',  [2, 4, 6])
+    ff_dim     = trial.suggest_categorical('ff_dim',     [32, 64, 128])
+    num_layers = trial.suggest_categorical('num_layers', [1, 2])
+    dropout    = trial.suggest_float('dropout', 0.2, 0.5, step=0.05)
+    l2_lambda  = trial.suggest_float('l2_lambda', 1e-3, 1e-1, log=True)
+    noise_std  = trial.suggest_float('noise_std', 0.05, 0.2, step=0.05)
+    lr         = trial.suggest_float('initial_lr', 3e-4, 1e-3, log=True)
+    batch      = trial.suggest_categorical('batch_size', [128, 256])
+
+    with suppress_output():
+        model = build_transformer(
+            input_shape=(window_size, feature_dim),
+            num_heads=num_heads, ff_dim=ff_dim, num_layers=num_layers,
+            dropout=dropout, l2_lambda=l2_lambda, noise_std=noise_std)
+        model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
+
+    early = EarlyStopping(monitor='val_loss', patience=15,
+                          min_delta=1e-4, restore_best_weights=True)
+    warmup = WarmUpCosineDecay(initial_lr=lr,
+                               warmup_epochs=10,
+                               total_epochs=200,
+                               steps_per_epoch=len(X_tr_seq)//batch)
+
+    history = model.fit(
+        X_tr_seq, y_tr_seq,
+        validation_data=(X_val_seq, y_val_seq),
+        epochs=200,
+        batch_size=batch,
+        callbacks=[early, warmup],
+        verbose=0)
+
+    return min(history.history['val_loss'])
+
+
+# ----------------------------------------------------------------------
+# 7. Final TimeSeriesSplit training + YOUR TWO PLOTS
+# ----------------------------------------------------------------------
+def train_final_tss(model_params, train_params,
+                    X_train_seq, y_train_seq,
+                    X_test_seq, y_test_seq,
+                    train_date_seq, test_date_seq,
+                    train_real_date_seq, test_real_date_seq,
+                    y_scaler, n_splits=5):
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    fold_losses = []
+    best_model = None
+    best_val = np.inf
+    ws, fd = X_train_seq.shape[1], X_train_seq.shape[2]
+
+    print(f"\nStarting {n_splits}-fold TimeSeriesSplit CV on training data (1999–2020)")
+
+    for fold, (tr_idx, val_idx) in enumerate(tss.split(X_train_seq)):
+        print(f"\n=== FINAL FOLD {fold+1}/{n_splits} ===")
+        X_tr, y_tr = X_train_seq[tr_idx], y_train_seq[tr_idx]
+        X_val, y_val = X_train_seq[val_idx], y_train_seq[val_idx]
+
+        with suppress_output():
+            model = build_transformer(input_shape=(ws, fd), **model_params)
+            model.compile(optimizer=Adam(learning_rate=train_params['initial_lr']),
+                          loss='mse')
+
+        early = EarlyStopping(monitor='val_loss', patience=25,
+                              min_delta=1e-4, restore_best_weights=True)
+        reduce = ReduceLROnPlateau(monitor='val_loss', factor=0.5,
+                                   patience=12, verbose=0)
+        ckpt = ModelCheckpoint(f'final_best_fold_{fold}.keras',
+                               monitor='val_loss', save_best_only=True,
+                               verbose=0)
+        warmup = WarmUpCosineDecay(initial_lr=train_params['initial_lr'],
+                                   warmup_epochs=20,
+                                   total_epochs=200,
+                                   steps_per_epoch=len(X_tr)//train_params['batch_size'])
+
+        hist = model.fit(
+            X_tr, y_tr,
+            validation_data=(X_val, y_val),
+            epochs=200,
+            batch_size=train_params['batch_size'],
+            callbacks=[early, reduce, ckpt, warmup],
+            verbose=2)
+
+        vloss = min(hist.history['val_loss'])
+        fold_losses.append(vloss)
+        if vloss < best_val:
+            best_val = vloss
+            best_model = tf.keras.models.load_model(
+                f'final_best_fold_{fold}.keras',
+                custom_objects={'TransposeLayer': TransposeLayer})
+
+    print(f"\nTimeSeriesSplit CV complete. Mean val loss: {np.mean(fold_losses):.6f} ± {np.std(fold_losses):.6f}")
+
+    # ---- Final model: retrain on FULL training data using best params ----
+    print("\nRetraining final model on FULL training data (1999–2020)...")
+    with suppress_output():
+        final_model = build_transformer(input_shape=(ws, fd), **model_params)
+        final_model.compile(optimizer=Adam(learning_rate=train_params['initial_lr']), loss='mse')
+
+    early = EarlyStopping(monitor='loss', patience=25, min_delta=1e-4, restore_best_weights=True)
+    warmup = WarmUpCosineDecay(initial_lr=train_params['initial_lr'],
+                               warmup_epochs=20,
+                               total_epochs=200,
+                               steps_per_epoch=len(X_train_seq)//train_params['batch_size'])
+
+    final_model.fit(
+        X_train_seq, y_train_seq,
+        epochs=200,
+        batch_size=train_params['batch_size'],
+        callbacks=[early, warmup],
+        verbose=2)
+
+    best_model = final_model
+
+    # ---- predictions -------------------------------------------------------
+    with suppress_output():
+        tr_pred = best_model.predict(X_train_seq).flatten()
+        te_pred = best_model.predict(X_test_seq).flatten()
+        tr_pred = y_scaler.inverse_transform(tr_pred.reshape(-1, 1)).flatten()
+        te_pred = y_scaler.inverse_transform(te_pred.reshape(-1, 1)).flatten()
+        y_tr_true = y_scaler.inverse_transform(y_train_seq.reshape(-1, 1)).flatten()
+        y_te_true = y_scaler.inverse_transform(y_test_seq.reshape(-1, 1)).flatten()
+
+    # ---- save CSV ----------------------------------------------------------
+    results = pd.DataFrame({
+        'Date': np.concatenate([train_date_seq, test_date_seq]),
+        'Actual': np.concatenate([y_tr_true, y_te_true]),
+        'Predicted': np.concatenate([tr_pred, te_pred]),
+        'all_dates': np.concatenate([train_date_seq, test_date_seq]),
+        'dates': np.concatenate([train_date_seq, test_date_seq]),
+        'real_dates': np.concatenate([train_real_date_seq, test_real_date_seq])
+    })
+    for c in ['Date', 'all_dates', 'dates']:
+        results[c] = pd.to_datetime(results[c], errors='coerce').dt.strftime('%Y-%m-%d')
+    results['real_dates'] = pd.to_datetime(results['real_dates'],
+                                          errors='coerce').dt.strftime('%Y-%m-%d')
+    results.to_csv('prediction_OTAMA_optuna_fixedsplit_tss.csv',
+                   index=False, float_format='%.3f')
+
+    # ---- PLOTTING: YOUR EXACT PLOT -----------------------------------------
+    data = pd.read_csv('prediction_OTAMA_optuna_fixedsplit_tss.csv')
+    data['all_dates'] = pd.to_datetime(data['all_dates'], format='%Y-%m-%d', errors='coerce')
+    data = data.dropna(subset=['all_dates'])
+
+    filtered = data[data['all_dates'].isin(data['real_dates'].dropna())].copy()
+    filtered_data = filtered if not filtered.empty else data.copy()
+
+    # Split into training (1999–2020) and testing (2021–2025) periods
+    train_data = filtered_data[filtered_data['all_dates'] <= '2020-12-31']
+    test_data = filtered_data[filtered_data['all_dates'] >= '2021-01-01']
+
+    # Extract observed and modeled values
+    obs_train = train_data['Actual'].values
+    yates_train = train_data['Predicted'].values
+    obs_test = test_data['Actual'].values
+    yates_test = test_data['Predicted'].values
+
+    # Calculate metrics for training period
+    cc_train = np.corrcoef(obs_train, yates_train)[0, 1] if len(obs_train) > 1 else 0
+    rmse_train = np.sqrt(mean_squared_error(obs_train, yates_train))
+    std_train_obs = np.std(obs_train) if len(obs_train) > 1 else 1
+    std_train_yates = np.std(yates_train) if len(yates_train) > 1 else 1
+    norm_rmse_train = rmse_train / std_train_obs
+    norm_std_train = std_train_yates / std_train_obs
+    loss_train = np.sqrt((0 - norm_rmse_train) ** 2 + (1 - cc_train) ** 2 + (1 - norm_std_train) ** 2)
+
+    # Calculate metrics for testing period
+    cc_test = np.corrcoef(obs_test, yates_test)[0, 1] if len(obs_test) > 1 else 0
+    rmse_test = np.sqrt(mean_squared_error(obs_test, yates_test))
+    std_test_obs = np.std(obs_test) if len(obs_test) > 1 else 1
+    std_test_yates = np.std(yates_test) if len(yates_test) > 1 else 1
+    norm_rmse_test = rmse_test / std_test_obs
+    norm_std_test = std_test_yates / std_test_obs
+    loss_test = np.sqrt((0 - norm_rmse_test) ** 2 + (1 - cc_test) ** 2 + (1 - norm_std_test) ** 2)
+
+    # === YOUR PLOT ===
+    filtered_data['Date'] = pd.to_datetime(filtered_data['Date'], format='mixed', errors='coerce')
+    plt.figure(figsize=(14, 6))
+    plt.plot(filtered_data['Date'].values, filtered_data['Actual'].values,
+             label='Observation', color='blue')
+    plt.plot(filtered_data['Date'].values, filtered_data['Predicted'].values,
+             label='iTransformer', color='red', linestyle='--', linewidth=1.5)
+
+    # Shade the prediction period (2021–2025)
+    plt.axvspan(pd.Timestamp('2021-01-01'), pd.Timestamp('2025-02-07'),
+                color='gray', alpha=0.3, label='Prediction Period')
+
+    # Add metrics to the plot
+    plt.text(
+        0.01, 1,
+        f'Training (1999–2020):\nCC = {cc_train:.3f}\nNorm RMSE = {norm_rmse_train:.3f}\nNorm STD = {norm_std_train:.3f}\nLoss = {loss_train:.3f}\n\n'
+        f'Testing (2021–2025):\nCC = {cc_test:.3f}\nNorm RMSE = {norm_rmse_test:.3f}\nNorm STD = {norm_std_test:.3f}\nLoss = {loss_test:.3f}',
+        transform=plt.gca().transAxes,
+        fontsize=10,
+        verticalalignment='top',
+        bbox=dict(facecolor='white', alpha=0.8, edgecolor='black')
+    )
+
+    # Title, labels, formatting
+    plt.ylabel('Shoreline Position')
+    plt.title('Otama_TimeSeriesSplit_iT_HPO')
+    plt.gca().xaxis.set_major_locator(mdates.YearLocator(3))
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    plt.gcf().autofmt_xdate()
+    plt.legend(loc='upper left', bbox_to_anchor=(0.15, 1))
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig('Otama_TimeSeriesSplit_iT_HPO_new.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    return best_model
+
+
+# ----------------------------------------------------------------------
+# 8. MAIN – 75/25 split for HPO, TimeSeriesSplit for final evaluation
+# ----------------------------------------------------------------------
+def main():
+    WINDOW_SIZE = 60
+    N_TRIALS    = 10
+    N_SPLITS    = 4          # TimeSeriesSplit folds
+
+    print("Loading data …")
+    with suppress_output():
+        (X_train, X_test, y_train, y_test,
+         tr_dates, te_dates,
+         tr_real, te_real,
+         _, y_scaler) = load_and_preprocess_data(
+            '/home/ubuntu/DeepLearning/OTAMA_linear_smoothed_dates.csv')
+        
+        X_train_seq, y_train_seq, tr_date_seq, tr_real_seq = create_sequences(
+            X_train, y_train, tr_dates, tr_real, WINDOW_SIZE)
+        X_test_seq,  y_test_seq,  te_date_seq, te_real_seq = create_sequences(
+            X_test,  y_test,  te_dates, te_real, WINDOW_SIZE)
+
+    print(f"Train seq: {len(X_train_seq)} | Test seq: {len(X_test_seq)}")
+
+    # 75/25 fixed split for HPO
+    split_idx = int(0.75 * len(X_train_seq))
+    X_tr_hpo, X_val_hpo = X_train_seq[:split_idx], X_train_seq[split_idx:]
+    y_tr_hpo, y_val_hpo = y_train_seq[:split_idx], y_train_seq[split_idx:]
+
+    print("\n" + "="*60)
+    print("OPTUNA HPO (75/25 fixed split) – single process")
+    print("="*60)
+
+    study = optuna.create_study(
+        direction='minimize',
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10))
+
+    study.enqueue_trial({
+        'num_heads': 4, 'ff_dim': 64, 'num_layers': 2,
+        'dropout': 0.3, 'l2_lambda': 0.05, 'noise_std': 0.1,
+        'initial_lr': 0.0005, 'batch_size': 256
+    })
+
+    study.optimize(
+        lambda trial: objective(trial,
+                                X_tr_hpo, y_tr_hpo,
+                                X_val_hpo, y_val_hpo,
+                                WINDOW_SIZE, X_train_seq.shape[2]),
+        n_trials=N_TRIALS,
+        show_progress_bar=True)
+
+    print("\nBest validation loss :", study.best_value)
+    print("Best params:")
+    for k, v in study.best_params.items():
+        print(f"  {k}: {v}")
+
+    study.trials_dataframe().to_csv('optuna_fixedsplit_trials.csv', index=False)
+
+    print("\n" + "="*60)
+    print(f"FINAL {N_SPLITS}-FOLD TimeSeriesSplit EVALUATION ON TRAINING DATA")
+    print("="*60)
+
+    model_params = {k: study.best_params[k] for k in
+                    ['num_heads','ff_dim','num_layers',
+                     'dropout','l2_lambda','noise_std']}
+    train_params = {'initial_lr': study.best_params['initial_lr'],
+                    'batch_size': study.best_params['batch_size']}
+
+    train_final_tss(
+        model_params=model_params,
+        train_params=train_params,
+        X_train_seq=X_train_seq, y_train_seq=y_train_seq,
+        X_test_seq=X_test_seq, y_test_seq=y_test_seq,
+        train_date_seq=tr_date_seq, test_date_seq=te_date_seq,
+        train_real_date_seq=tr_real_seq, test_real_date_seq=te_real_seq,
+        y_scaler=y_scaler,
+        n_splits=N_SPLITS)
+
+    print("\n=== ALL DONE ===")
+
+
+if __name__ == "__main__":
+    main()
