@@ -31,7 +31,9 @@ from tensorflow.keras.layers import (
     MultiHeadAttention, Add, Layer, GaussianNoise, Flatten
 )
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, Callback
+from tensorflow.keras.callbacks import (
+    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, Callback
+)
 from tensorflow.keras.regularizers import l2
 
 import optuna
@@ -72,13 +74,13 @@ class WarmUpCosineDecay(Callback):
         cur_epoch = self.global_step // self.steps_per_epoch
 
         if cur_epoch < self.warmup_epochs:
-            lr = self.initial_lr * (self.global_step / (self.warmup_epochs * self.steps_per_epoch))
+            lr = self.initial_lr * (self.global_step /
+                                   (self.warmup_epochs * self.steps_per_epoch))
         else:
-            progress = (self.global_step - self.warmup_epochs * self.steps_per_epoch) / \
+            progress = (self.global_step -
+                        self.warmup_epochs * self.steps_per_epoch) / \
                        ((self.total_epochs - self.warmup_epochs) * self.steps_per_epoch)
             lr = self.initial_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
-            
-
 
         self.model.optimizer.learning_rate.assign(lr)
         self.history.setdefault('lr', []).append(lr)
@@ -108,7 +110,7 @@ def load_and_preprocess_data(filepath):
 
     # Split BEFORE any rolling operations
     train = data[data['dates'].dt.year <= 2020].copy()
-    test  = data[data['dates'].dt.year > 2020].copy()
+    test = data[data['dates'].dt.year > 2020].copy()
 
     # Optional: add rolling features safely (per split)
     for df in [train, test]:
@@ -121,11 +123,11 @@ def load_and_preprocess_data(filepath):
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(train[feats])
-    X_test  = scaler.transform(test[feats])
+    X_test = scaler.transform(test[feats])
 
     y_scaler = StandardScaler()
     y_train = y_scaler.fit_transform(train[[target]]).flatten()
-    y_test  = y_scaler.transform(test[[target]]).flatten()
+    y_test = y_scaler.transform(test[[target]]).flatten()
 
     return (X_train, X_test, y_train, y_test,
             train['dates'].values, test['dates'].values,
@@ -153,8 +155,10 @@ class TransposeLayer(Layer):
     def __init__(self, perm, **kwargs):
         super().__init__(**kwargs)
         self.perm = perm
+
     def call(self, inputs):
         return tf.transpose(inputs, perm=self.perm)
+
     def get_config(self):
         cfg = super().get_config()
         cfg.update({"perm": self.perm})
@@ -166,14 +170,15 @@ class TransposeLayer(Layer):
 # ----------------------------------------------------------------------
 def build_transformer(input_shape,
                       num_heads=4, ff_dim=64, num_layers=2,
-                      dropout=0.3, l2_lambda=0.05, noise_std=0.1):
+                      dropout=0.3, l2_lambda=0.05, noise_std=0.1,
+                      dense_units=32):
     inputs = Input(shape=input_shape)
     x = GaussianNoise(stddev=noise_std)(inputs, training=True)
     x = TransposeLayer(perm=[0, 2, 1])(x)
 
     def pos_enc(length, d_model):
         pos = np.arange(length)[:, None]
-        i   = np.arange(d_model)[None, :]
+        i = np.arange(d_model)[None, :]
         angle = pos / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
         angle[:, 0::2] = np.sin(angle[:, 0::2])
         angle[:, 1::2] = np.cos(angle[:, 1::2])
@@ -182,7 +187,8 @@ def build_transformer(input_shape,
     x = x + pos_enc(input_shape[1], input_shape[0])
 
     for _ in range(num_layers):
-        attn = MultiHeadAttention(num_heads=num_heads, key_dim=input_shape[0],
+        attn = MultiHeadAttention(num_heads=num_heads,
+                                  key_dim=input_shape[0],
                                   dropout=dropout)(x, x)
         x = Add()([x, attn])
         x = LayerNormalization(epsilon=1e-6)(x)
@@ -198,7 +204,8 @@ def build_transformer(input_shape,
 
     x = TransposeLayer(perm=[0, 2, 1])(x)
     x = Flatten()(x)
-    x = Dense(32, activation='relu',
+
+    x = Dense(dense_units, activation='relu',
               kernel_regularizer=l2(l2_lambda))(x)
     x = Dropout(dropout)(x)
     outputs = Dense(1)(x)
@@ -213,20 +220,24 @@ def objective(trial,
               X_val_seq, y_val_seq,
               window_size, feature_dim):
 
-    num_heads  = trial.suggest_categorical('num_heads',  [2, 4, 6])
-    ff_dim     = trial.suggest_categorical('ff_dim',     [32, 64, 128])
+    num_heads = trial.suggest_categorical('num_heads', [2, 4, 6])
+    ff_dim = trial.suggest_categorical('ff_dim', [32, 64, 128])
     num_layers = trial.suggest_categorical('num_layers', [1, 2])
-    dropout    = trial.suggest_float('dropout', 0.2, 0.5, step=0.05)
-    l2_lambda  = trial.suggest_float('l2_lambda', 1e-3, 1e-1, log=True)
-    noise_std  = trial.suggest_float('noise_std', 0.05, 0.2, step=0.05)
-    lr         = trial.suggest_float('initial_lr', 3e-4, 1e-3, log=True)
-    batch      = trial.suggest_categorical('batch_size', [128, 256])
+    dropout = trial.suggest_float('dropout', 0.1, 0.5, step=0.05)
+    l2_lambda = trial.suggest_float('l2_lambda', 1e-3, 1e-1, log=True)
+    noise_std = trial.suggest_float('noise_std', 0.05, 0.2, step=0.05)
+    dense_units = trial.suggest_categorical('dense_units', [16, 32, 64])
+
+    lr = trial.suggest_float('initial_lr', 3e-4, 1e-3, log=True)
+    batch = trial.suggest_categorical('batch_size', [128, 256])
 
     with suppress_output():
         model = build_transformer(
             input_shape=(window_size, feature_dim),
             num_heads=num_heads, ff_dim=ff_dim, num_layers=num_layers,
-            dropout=dropout, l2_lambda=l2_lambda, noise_std=noise_std)
+            dropout=dropout, l2_lambda=l2_lambda, noise_std=noise_std,
+            dense_units=dense_units)
+
         model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
 
     early = EarlyStopping(monitor='val_loss', patience=15,
@@ -234,7 +245,7 @@ def objective(trial,
     warmup = WarmUpCosineDecay(initial_lr=lr,
                                warmup_epochs=10,
                                total_epochs=200,
-                               steps_per_epoch=len(X_tr_seq)//batch)
+                               steps_per_epoch=len(X_tr_seq) // batch)
 
     history = model.fit(
         X_tr_seq, y_tr_seq,
@@ -265,7 +276,7 @@ def train_final_kfold(model_params, train_params,
     print(f"\nStarting {n_splits}-Fold CV on training data (1999–2020)")
 
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train_seq)):
-        print(f"\n=== FINAL FOLD {fold+1}/{n_splits} ===")
+        print(f"\n=== FINAL FOLD {fold + 1}/{n_splits} ===")
         X_tr, y_tr = X_train_seq[tr_idx], y_train_seq[tr_idx]
         X_val, y_val = X_train_seq[val_idx], y_train_seq[val_idx]
 
@@ -284,7 +295,7 @@ def train_final_kfold(model_params, train_params,
         warmup = WarmUpCosineDecay(initial_lr=train_params['initial_lr'],
                                    warmup_epochs=20,
                                    total_epochs=200,
-                                   steps_per_epoch=len(X_tr)//train_params['batch_size'])
+                                   steps_per_epoch=len(X_tr) // train_params['batch_size'])
 
         hist = model.fit(
             X_tr, y_tr,
@@ -302,19 +313,22 @@ def train_final_kfold(model_params, train_params,
                 f'final_best_fold_{fold}.keras',
                 custom_objects={'TransposeLayer': TransposeLayer})
 
-    print(f"\nK-Fold CV complete. Mean val loss: {np.mean(fold_losses):.6f} ± {np.std(fold_losses):.6f}")
+    print(f"\nK-Fold CV complete. Mean val loss: {np.mean(fold_losses):.6f} "
+          f"± {np.std(fold_losses):.6f}")
 
     # ---- Final model: retrain on FULL training data using best params ----
     print("\nRetraining final model on FULL training data (1999–2020)...")
     with suppress_output():
         final_model = build_transformer(input_shape=(ws, fd), **model_params)
-        final_model.compile(optimizer=Adam(learning_rate=train_params['initial_lr']), loss='mse')
+        final_model.compile(optimizer=Adam(learning_rate=train_params['initial_lr']),
+                            loss='mse')
 
-    early = EarlyStopping(monitor='loss', patience=25, min_delta=1e-4, restore_best_weights=True)
+    early = EarlyStopping(monitor='loss', patience=25,
+                          min_delta=1e-4, restore_best_weights=True)
     warmup = WarmUpCosineDecay(initial_lr=train_params['initial_lr'],
                                warmup_epochs=20,
                                total_epochs=200,
-                               steps_per_epoch=len(X_train_seq)//train_params['batch_size'])
+                               steps_per_epoch=len(X_train_seq) // train_params['batch_size'])
 
     final_model.fit(
         X_train_seq, y_train_seq,
@@ -345,15 +359,17 @@ def train_final_kfold(model_params, train_params,
         'real_dates': np.concatenate([train_real_date_seq, test_real_date_seq])
     })
     for c in ['Date', 'all_dates', 'dates']:
-        results[c] = pd.to_datetime(results[c], errors='coerce').dt.strftime('%Y-%m-%d')
+        results[c] = pd.to_datetime(results[c],
+                                    errors='coerce').dt.strftime('%Y-%m-%d')
     results['real_dates'] = pd.to_datetime(results['real_dates'],
-                                          errors='coerce').dt.strftime('%Y-%m-%d')
-    results.to_csv('prediction_OTAMA_optuna_fixedsplit_kfold.csv',
+                                           errors='coerce').dt.strftime('%Y-%m-%d')
+    results.to_csv('prediction_Muri_optuna_fixedsplit_kfold.csv',
                    index=False, float_format='%.3f')
 
     # ---- PLOTTING: YOUR EXACT PLOT -----------------------------------------
-    data = pd.read_csv('prediction_OTAMA_optuna_fixedsplit_kfold.csv')
-    data['all_dates'] = pd.to_datetime(data['all_dates'], format='%Y-%m-%d', errors='coerce')
+    data = pd.read_csv('prediction_Muri_optuna_fixedsplit_kfold.csv')
+    data['all_dates'] = pd.to_datetime(data['all_dates'],
+                                       format='%Y-%m-%d', errors='coerce')
     data = data.dropna(subset=['all_dates'])
 
     filtered = data[data['all_dates'].isin(data['real_dates'].dropna())].copy()
@@ -376,7 +392,9 @@ def train_final_kfold(model_params, train_params,
     std_train_yates = np.std(yates_train) if len(yates_train) > 1 else 1
     norm_rmse_train = rmse_train / std_train_obs
     norm_std_train = std_train_yates / std_train_obs
-    loss_train = np.sqrt((0 - norm_rmse_train) ** 2 + (1 - cc_train) ** 2 + (1 - norm_std_train) ** 2)
+    loss_train = np.sqrt((0 - norm_rmse_train) ** 2 +
+                         (1 - cc_train) ** 2 +
+                         (1 - norm_std_train) ** 2)
 
     # Calculate metrics for testing period
     cc_test = np.corrcoef(obs_test, yates_test)[0, 1] if len(obs_test) > 1 else 0
@@ -385,10 +403,13 @@ def train_final_kfold(model_params, train_params,
     std_test_yates = np.std(yates_test) if len(yates_test) > 1 else 1
     norm_rmse_test = rmse_test / std_test_obs
     norm_std_test = std_test_yates / std_test_obs
-    loss_test = np.sqrt((0 - norm_rmse_test) ** 2 + (1 - cc_test) ** 2 + (1 - norm_std_test) ** 2)
+    loss_test = np.sqrt((0 - norm_rmse_test) ** 2 +
+                        (1 - cc_test) ** 2 +
+                        (1 - norm_std_test) ** 2)
 
     # === YOUR PLOT ===
-    filtered_data['Date'] = pd.to_datetime(filtered_data['Date'], format='mixed', errors='coerce')
+    filtered_data['Date'] = pd.to_datetime(filtered_data['Date'],
+                                          format='mixed', errors='coerce')
     plt.figure(figsize=(14, 6))
     plt.plot(filtered_data['Date'].values, filtered_data['Actual'].values,
              label='Observation', color='blue')
@@ -402,8 +423,10 @@ def train_final_kfold(model_params, train_params,
     # Add metrics to the plot
     plt.text(
         0.01, 1,
-        f'Training (1999–2020):\nCC = {cc_train:.3f}\nNorm RMSE = {norm_rmse_train:.3f}\nNorm STD = {norm_std_train:.3f}\nLoss = {loss_train:.3f}\n\n'
-        f'Testing (2021–2025):\nCC = {cc_test:.3f}\nNorm RMSE = {norm_rmse_test:.3f}\nNorm STD = {norm_std_test:.3f}\nLoss = {loss_test:.3f}',
+        f'Training (1999–2020):\nCC = {cc_train:.3f}\nNorm RMSE = {norm_rmse_train:.3f}\n'
+        f'Norm STD = {norm_std_train:.3f}\nLoss = {loss_train:.3f}\n\n'
+        f'Testing (2021–2025):\nCC = {cc_test:.3f}\nNorm RMSE = {norm_rmse_test:.3f}\n'
+        f'Norm STD = {norm_std_test:.3f}\nLoss = {loss_test:.3f}',
         transform=plt.gca().transAxes,
         fontsize=10,
         verticalalignment='top',
@@ -412,14 +435,14 @@ def train_final_kfold(model_params, train_params,
 
     # Title, labels, formatting
     plt.ylabel('Shoreline Position')
-    plt.title('Otama_KFold_iT_HPO')
+    plt.title('Muri_KFold_iT_HPO')
     plt.gca().xaxis.set_major_locator(mdates.YearLocator(3))
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     plt.gcf().autofmt_xdate()
     plt.legend(loc='upper left', bbox_to_anchor=(0.15, 1))
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plt.savefig('Otama_KFold_iT_HPO_new.png', dpi=300, bbox_inches='tight')
+    plt.savefig('Muri_KFold_iT_HPO_new2.png', dpi=300, bbox_inches='tight')
     plt.show()
 
     return best_model
@@ -430,8 +453,8 @@ def train_final_kfold(model_params, train_params,
 # ----------------------------------------------------------------------
 def main():
     WINDOW_SIZE = 60
-    N_TRIALS    = 10
-    N_SPLITS    = 4  # K-Fold
+    N_TRIALS = 10
+    N_SPLITS = 4  # K-Fold
 
     print("Loading data …")
     with suppress_output():
@@ -439,12 +462,12 @@ def main():
          tr_dates, te_dates,
          tr_real, te_real,
          _, y_scaler) = load_and_preprocess_data(
-            '/home/ubuntu/DeepLearning/OTAMA_linear_smoothed_dates.csv')
-        
+            '/home/ubuntu/DeepLearning/Muriwai_smoothed.csv')
+
         X_train_seq, y_train_seq, tr_date_seq, tr_real_seq = create_sequences(
             X_train, y_train, tr_dates, tr_real, WINDOW_SIZE)
-        X_test_seq,  y_test_seq,  te_date_seq, te_real_seq = create_sequences(
-            X_test,  y_test,  te_dates, te_real, WINDOW_SIZE)
+        X_test_seq, y_test_seq, te_date_seq, te_real_seq = create_sequences(
+            X_test, y_test, te_dates, te_real, WINDOW_SIZE)
 
     print(f"Train seq: {len(X_train_seq)} | Test seq: {len(X_test_seq)}")
 
@@ -453,9 +476,9 @@ def main():
     X_tr_hpo, X_val_hpo = X_train_seq[:split_idx], X_train_seq[split_idx:]
     y_tr_hpo, y_val_hpo = y_train_seq[:split_idx], y_train_seq[split_idx:]
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("OPTUNA HPO (75/25 fixed split) – single process")
-    print("="*60)
+    print("=" * 60)
 
     study = optuna.create_study(
         direction='minimize',
@@ -465,6 +488,7 @@ def main():
     study.enqueue_trial({
         'num_heads': 4, 'ff_dim': 64, 'num_layers': 2,
         'dropout': 0.3, 'l2_lambda': 0.05, 'noise_std': 0.1,
+        'dense_units': 32,
         'initial_lr': 0.0005, 'batch_size': 256
     })
 
@@ -481,15 +505,16 @@ def main():
     for k, v in study.best_params.items():
         print(f"  {k}: {v}")
 
-    study.trials_dataframe().to_csv('optuna_fixedsplit_trials.csv', index=False)
+    study.trials_dataframe().to_csv('optuna_fixedsplit_trials2.csv', index=False)
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print(f"FINAL {N_SPLITS}-FOLD EVALUATION ON TRAINING DATA")
-    print("="*60)
+    print("=" * 60)
 
     model_params = {k: study.best_params[k] for k in
-                    ['num_heads','ff_dim','num_layers',
-                     'dropout','l2_lambda','noise_std']}
+                    ['num_heads', 'ff_dim', 'num_layers',
+                     'dropout', 'l2_lambda', 'noise_std', 'dense_units']}
+
     train_params = {'initial_lr': study.best_params['initial_lr'],
                     'batch_size': study.best_params['batch_size']}
 
