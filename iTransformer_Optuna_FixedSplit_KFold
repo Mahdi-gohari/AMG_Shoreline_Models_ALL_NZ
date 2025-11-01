@@ -1,9 +1,10 @@
-# OTAMA_iTransformer_Optuna_FixedSplit_KFold_NoParallel_withPlots.py
+# iTransformer_Optuna_FixedSplit_KFold_NoParallel_withPlots.py
 # ----------------------------------------------------
 # HPO  → 75% train / 25% validation (fixed split)
 # Final → K-Fold CV on training data (no leakage)
 # No parallelism, pandas bug fixed
 # TWO PLOTS: Time series + metrics (your exact version)
+# FIXED: CSV output – clean columns, correct real_dates
 # ----------------------------------------------------
 
 import os
@@ -37,6 +38,9 @@ from tensorflow.keras.callbacks import (
 from tensorflow.keras.regularizers import l2
 
 import optuna
+
+
+BEACH_NAME = 'Muri_TT'  # <--- Name of the beach
 
 # ----------------------------------------------------------------------
 # 1. Helper utilities
@@ -266,7 +270,7 @@ def train_final_kfold(model_params, train_params,
                       X_test_seq, y_test_seq,
                       train_date_seq, test_date_seq,
                       train_real_date_seq, test_real_date_seq,
-                      y_scaler, n_splits=5):
+                      y_scaler, n_splits=4):
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     fold_losses = []
     best_model = None
@@ -350,34 +354,35 @@ def train_final_kfold(model_params, train_params,
         y_te_true = y_scaler.inverse_transform(y_test_seq.reshape(-1, 1)).flatten()
 
     # ---- save CSV ----------------------------------------------------------
+    # FIXED: Only one date column + correct real_dates from input
     results = pd.DataFrame({
-        'Date': np.concatenate([train_date_seq, test_date_seq]),
+        'Date': np.concatenate([train_real_date_seq, test_real_date_seq]),  # Human-readable
         'Actual': np.concatenate([y_tr_true, y_te_true]),
         'Predicted': np.concatenate([tr_pred, te_pred]),
-        'all_dates': np.concatenate([train_date_seq, test_date_seq]),
-        'dates': np.concatenate([train_date_seq, test_date_seq]),
-        'real_dates': np.concatenate([train_real_date_seq, test_real_date_seq])
+        'real_dates': np.concatenate([train_real_date_seq, test_real_date_seq])  # Exact input dates
     })
-    for c in ['Date', 'all_dates', 'dates']:
-        results[c] = pd.to_datetime(results[c],
-                                    errors='coerce').dt.strftime('%Y-%m-%d')
-    results['real_dates'] = pd.to_datetime(results['real_dates'],
-                                           errors='coerce').dt.strftime('%Y-%m-%d')
-    results.to_csv('prediction_Muri_optuna_fixedsplit_kfold.csv',
-                   index=False, float_format='%.3f')
+
+    # Format both date columns as YYYY-MM-DD
+    for col in ['Date', 'real_dates']:
+        results[col] = pd.to_datetime(results[col], errors='coerce').dt.strftime('%Y-%m-%d')
+
+    results.to_csv(
+        f'/home/ubuntu/DeepLearning/NW/{BEACH_NAME}_prediction.csv',
+        index=False,
+        float_format='%.3f'
+    )
 
     # ---- PLOTTING: YOUR EXACT PLOT -----------------------------------------
-    data = pd.read_csv('prediction_Muri_optuna_fixedsplit_kfold.csv')
-    data['all_dates'] = pd.to_datetime(data['all_dates'],
-                                       format='%Y-%m-%d', errors='coerce')
-    data = data.dropna(subset=['all_dates'])
+    data = pd.read_csv(f'/home/ubuntu/DeepLearning/NW/{BEACH_NAME}_prediction.csv')
+    data['Date'] = pd.to_datetime(data['Date'], format='%Y-%m-%d', errors='coerce')
+    data = data.dropna(subset=['Date'])
 
-    filtered = data[data['all_dates'].isin(data['real_dates'].dropna())].copy()
-    filtered_data = filtered if not filtered.empty else data.copy()
+    # Use real_dates only if needed for filtering (optional)
+    filtered_data = data.copy()
 
     # Split into training (1999–2020) and testing (2021–2025) periods
-    train_data = filtered_data[filtered_data['all_dates'] <= '2020-12-31']
-    test_data = filtered_data[filtered_data['all_dates'] >= '2021-01-01']
+    train_data = filtered_data[filtered_data['Date'] <= '2020-12-31']
+    test_data = filtered_data[filtered_data['Date'] >= '2021-01-01']
 
     # Extract observed and modeled values
     obs_train = train_data['Actual'].values
@@ -408,8 +413,6 @@ def train_final_kfold(model_params, train_params,
                         (1 - norm_std_test) ** 2)
 
     # === YOUR PLOT ===
-    filtered_data['Date'] = pd.to_datetime(filtered_data['Date'],
-                                          format='mixed', errors='coerce')
     plt.figure(figsize=(14, 6))
     plt.plot(filtered_data['Date'].values, filtered_data['Actual'].values,
              label='Observation', color='blue')
@@ -435,14 +438,15 @@ def train_final_kfold(model_params, train_params,
 
     # Title, labels, formatting
     plt.ylabel('Shoreline Position')
-    plt.title('Muri_KFold_iT_HPO')
+    plt.title(f'{BEACH_NAME}_KFold_iT_HPO')
+
     plt.gca().xaxis.set_major_locator(mdates.YearLocator(3))
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     plt.gcf().autofmt_xdate()
     plt.legend(loc='upper left', bbox_to_anchor=(0.15, 1))
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plt.savefig('Muri_KFold_iT_HPO_new2.png', dpi=300, bbox_inches='tight')
+    plt.savefig(f'{BEACH_NAME}_time_series.png', dpi=300, bbox_inches='tight') 
     plt.show()
 
     return best_model
@@ -462,7 +466,7 @@ def main():
          tr_dates, te_dates,
          tr_real, te_real,
          _, y_scaler) = load_and_preprocess_data(
-            '/home/ubuntu/DeepLearning/Muriwai_smoothed.csv')
+            '/home/ubuntu/DeepLearning/NW/Muriwai_smoothed.csv')
 
         X_train_seq, y_train_seq, tr_date_seq, tr_real_seq = create_sequences(
             X_train, y_train, tr_dates, tr_real, WINDOW_SIZE)
@@ -486,9 +490,9 @@ def main():
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10))
 
     study.enqueue_trial({
-        'num_heads': 4, 'ff_dim': 64, 'num_layers': 2,
+        'num_heads': 4, 'ff_dim': 32, 'num_layers': 2,
         'dropout': 0.3, 'l2_lambda': 0.05, 'noise_std': 0.1,
-        'dense_units': 32,
+        'dense_units': 16,
         'initial_lr': 0.0005, 'batch_size': 256
     })
 
@@ -505,7 +509,7 @@ def main():
     for k, v in study.best_params.items():
         print(f"  {k}: {v}")
 
-    study.trials_dataframe().to_csv('optuna_fixedsplit_trials2.csv', index=False)
+    study.trials_dataframe().to_csv(f'{BEACH_NAME}_optuna_trials.csv', index=False)
 
     print("\n" + "=" * 60)
     print(f"FINAL {N_SPLITS}-FOLD EVALUATION ON TRAINING DATA")
