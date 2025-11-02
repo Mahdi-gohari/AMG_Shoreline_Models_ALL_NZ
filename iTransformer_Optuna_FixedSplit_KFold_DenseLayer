@@ -1,10 +1,11 @@
-# iTransformer_Optuna_FixedSplit_KFold_NoParallel_withPlots.py
+# iTransformer_Optuna_FixedSplit_KFold_NoParallel_withInputProj_FINAL_FIXED.py
 # ----------------------------------------------------
-# HPO  → 75% train / 25% validation (fixed split)
+# HPO  → 75% train / 25% validation (fixed split)
 # Final → K-Fold CV on training data (no leakage)
 # No parallelism, pandas bug fixed
-# TWO PLOTS: Time series + metrics (your exact version)
-# ADDED: input_proj_dim + Dense projection layer
+# ONE final dense layer
+# NEW: Input-projection dense layer (dimension reduction)
+# FIXED: Positional encoding broadcasting → (1, seq_len, d_model)
 # ----------------------------------------------------
 
 import os
@@ -24,7 +25,7 @@ import random
 import sys
 from contextlib import contextmanager
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import (
@@ -33,14 +34,16 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import (
-    EarlyStopping, ReduceLROnPlateau, ModelCheckpoint, Callback
+    EarlyStopping, ReduceLROnPlateau, Callback
 )
 from tensorflow.keras.regularizers import l2
 
 import optuna
 
-
-BEACH_NAME = 'Muri_test'  # <--- Name of the beach
+# ----------------------------------------------------------------------
+# USER-DEFINED OUTPUT PREFIX (CHANGE THIS ONCE)
+# ----------------------------------------------------------------------
+OUTPUT_PREFIX = "Muri_1_"  # <<< CHANGE THIS NAME HERE
 
 # ----------------------------------------------------------------------
 # 1. Helper utilities
@@ -82,8 +85,8 @@ class WarmUpCosineDecay(Callback):
                                    (self.warmup_epochs * self.steps_per_epoch))
         else:
             progress = (self.global_step -
-                        self.warmup_epochs * self.steps_per_epoch) / \
-                       ((self.total_epochs - self.warmup_epochs) * self.steps_per_epoch)
+                         self.warmup_epochs * self.steps_per_epoch) / \
+                        ((self.total_epochs - self.warmup_epochs) * self.steps_per_epoch)
             lr = self.initial_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
 
         self.model.optimizer.learning_rate.assign(lr)
@@ -112,14 +115,14 @@ def load_and_preprocess_data(filepath):
     data['Dir_transformed'] = transform_direction(data['Dir'])
     data = data.dropna(subset=['Dir_transformed'])
 
-    # Split BEFORE any rolling operations
+    # Split BEFORE rolling
     train = data[data['dates'].dt.year <= 2020].copy()
     test = data[data['dates'].dt.year > 2020].copy()
 
-    # Optional: add rolling features safely (per split)
+    # Rolling features (per split)
     for df in [train, test]:
         for col, win in [('Hs', 7), ('Hs', 30), ('Tp', 7), ('Tp', 30),
-                         ('Dir', 7), ('Dir', 30), ('Eng', 7), ('Eng', 30)]:
+                             ('Dir', 7), ('Dir', 30), ('Eng', 7), ('Eng', 30)]:
             df[f"{col}_ma_{win}"] = df[col].rolling(win, min_periods=1).mean()
 
     feats = ['Hs', 'Tp', 'Eng', 'month_cos', 'month_sin', 'Dir_transformed']
@@ -170,83 +173,106 @@ class TransposeLayer(Layer):
 
 
 # ----------------------------------------------------------------------
-# 5. iTransformer model builder (WITH INPUT PROJECTION)
+# 5. iTransformer model builder (input projection + one final dense)
 # ----------------------------------------------------------------------
 def build_transformer(input_shape,
-                      num_heads=4, ff_dim=64, num_layers=2,
+                      num_heads=4, ff_dim=32, num_layers=2,
                       dropout=0.3, l2_lambda=0.05, noise_std=0.1,
-                      dense_units=32, input_proj_dim=6):
-    inputs = Input(shape=input_shape)
+                      input_proj_dim=4, final_dense_units=16):
+    inputs = Input(shape=input_shape)                       # (window, raw_features)
+    window_size = input_shape[0]
     x = GaussianNoise(stddev=noise_std)(inputs, training=True)
-    x = TransposeLayer(perm=[0, 2, 1])(x)  # (batch, features, window) → (batch, window, features)
 
     # ---- Input projection (dimension reduction) ----
     x = Dense(input_proj_dim, activation='relu',
-              kernel_regularizer=l2(l2_lambda))(x)  # (batch, window, input_proj_dim)
+              kernel_regularizer=l2(l2_lambda))(x)          # (window, input_proj_dim)
 
-    # Positional encoding using projected dimension
-    def pos_enc(length, d_model):
-        pos = np.arange(length)[:, None]
-        i = np.arange(d_model)[None, :]
+    # ---- Corrected Positional encoding (1, seq_len, d_model) ----
+    def pos_enc(seq_len, d_model):
+        pos = np.arange(seq_len)[:, None]                   # (seq_len, 1)
+        i = np.arange(d_model)[None, :]                     # (1, d_model)
         angle = pos / np.power(10000, (2 * (i // 2)) / np.float32(d_model))
         angle[:, 0::2] = np.sin(angle[:, 0::2])
         angle[:, 1::2] = np.cos(angle[:, 1::2])
-        return tf.cast(angle[None, ...], tf.float32)
+        return tf.cast(angle[None, ...], tf.float32)        # (1, seq_len, d_model)
 
-    x = x + pos_enc(input_shape[1], input_proj_dim)
+    x = x + pos_enc(window_size, input_proj_dim)
+    # --------------------------------------------------------------
+
+    # (batch, input_proj_dim, window_size)
+    x = TransposeLayer(perm=[0, 2, 1])(x) 
+
+    # --- FIX APPLIED: Correct key_dim ---
+    # In Keras MHA, the last dimension is the embedding size (d_model).
+    # Since x is (batch, sequence_length, embedding_dimension), and for iT:
+    # sequence_length = input_proj_dim (features)
+    # embedding_dimension = window_size (time steps)
+    # We must set key_dim = embedding_dimension / num_heads = window_size / num_heads
+    
+    # We use window_size as the d_model for MHA
+    d_model_mha = window_size 
+    key_dim = d_model_mha // num_heads
 
     for _ in range(num_layers):
+        # MHA performs attention across the second dimension (input_proj_dim)
         attn = MultiHeadAttention(num_heads=num_heads,
-                                  key_dim=input_proj_dim,
-                                  dropout=dropout)(x, x)
+                                     key_dim=key_dim, # Corrected key_dim
+                                     dropout=dropout)(x, x)
         x = Add()([x, attn])
         x = LayerNormalization(epsilon=1e-6)(x)
         x = Dropout(dropout)(x)
 
         ff = Dense(ff_dim, activation='relu',
-                   kernel_regularizer=l2(l2_lambda))(x)
-        ff = Dense(input_proj_dim,
-                   kernel_regularizer=l2(l2_lambda))(ff)
+                      kernel_regularizer=l2(l2_lambda))(x)
+        
+        # The output dimension of the FF layer must match the input embedding dimension (window_size)
+        ff = Dense(window_size, 
+                      kernel_regularizer=l2(l2_lambda))(ff) 
         x = Add()([x, ff])
         x = LayerNormalization(epsilon=1e-6)(x)
         x = Dropout(dropout)(x)
 
-    x = TransposeLayer(perm=[0, 2, 1])(x)  # (batch, input_proj_dim, window)
+    x = TransposeLayer(perm=[0, 2, 1])(x)                   # (batch, window, input_proj_dim)
     x = Flatten()(x)
 
-    x = Dense(dense_units, activation='relu',
+    # ---- ONE final dense layer ----
+    x = Dense(final_dense_units, activation='relu',
               kernel_regularizer=l2(l2_lambda))(x)
     x = Dropout(dropout)(x)
     outputs = Dense(1)(x)
+    # --------------------------------
+
     return Model(inputs, outputs)
 
 
 # ----------------------------------------------------------------------
-# 6. Optuna objective – 75 % / 25 % fixed split (single process)
+# 6. Optuna objective – 75 % / 25 % fixed split
 # ----------------------------------------------------------------------
 def objective(trial,
               X_tr_seq, y_tr_seq,
               X_val_seq, y_val_seq,
-              window_size, feature_dim):
+              window_size, raw_feature_dim):
 
     num_heads = trial.suggest_categorical('num_heads', [2, 4, 6])
-    ff_dim = trial.suggest_categorical('ff_dim', [32, 64, 128])
-    num_layers = trial.suggest_categorical('num_layers', [1, 2])
-    dropout = trial.suggest_float('dropout', 0.1, 0.5, step=0.05)
+    ff_dim = trial.suggest_categorical('ff_dim', [16, 32, 64, 128])
+    num_layers = trial.suggest_categorical('num_layers', [1, 2, 3])
+    dropout = trial.suggest_float('dropout', 0.1, 0.6, step=0.05)
     l2_lambda = trial.suggest_float('l2_lambda', 1e-3, 1e-1, log=True)
-    noise_std = trial.suggest_float('noise_std', 0.05, 0.2, step=0.05)
-    dense_units = trial.suggest_categorical('dense_units', [16, 32, 64])
+    noise_std = trial.suggest_float('noise_std', 0.05, 0.3, step=0.05)
+
     input_proj_dim = trial.suggest_categorical('input_proj_dim', [3, 4, 5, 6])  # 6 = no reduction
+    final_dense_units = trial.suggest_categorical('final_dense_units', [8, 16, 32])
 
     lr = trial.suggest_float('initial_lr', 3e-4, 1e-3, log=True)
     batch = trial.suggest_categorical('batch_size', [128, 256])
 
     with suppress_output():
         model = build_transformer(
-            input_shape=(window_size, feature_dim),
+            input_shape=(window_size, raw_feature_dim),
             num_heads=num_heads, ff_dim=ff_dim, num_layers=num_layers,
             dropout=dropout, l2_lambda=l2_lambda, noise_std=noise_std,
-            dense_units=dense_units, input_proj_dim=input_proj_dim)
+            input_proj_dim=input_proj_dim,
+            final_dense_units=final_dense_units)
 
         model.compile(optimizer=Adam(learning_rate=lr), loss='mse')
 
@@ -269,7 +295,7 @@ def objective(trial,
 
 
 # ----------------------------------------------------------------------
-# 7. Final K-Fold training + YOUR TWO PLOTS
+# 7. Final K-Fold training + plots (no SHAP)
 # ----------------------------------------------------------------------
 def train_final_kfold(model_params, train_params,
                       X_train_seq, y_train_seq,
@@ -298,35 +324,32 @@ def train_final_kfold(model_params, train_params,
         early = EarlyStopping(monitor='val_loss', patience=25,
                               min_delta=1e-4, restore_best_weights=True)
         reduce = ReduceLROnPlateau(monitor='val_loss', factor=0.5,
-                                   patience=12, verbose=0)
-        ckpt = ModelCheckpoint(f'final_best_fold_{fold}.keras',
-                               monitor='val_loss', save_best_only=True,
-                               verbose=0)
+                                       patience=12, verbose=0)
         warmup = WarmUpCosineDecay(initial_lr=train_params['initial_lr'],
-                                   warmup_epochs=20,
-                                   total_epochs=200,
-                                   steps_per_epoch=len(X_tr) // train_params['batch_size'])
+                                       warmup_epochs=20,
+                                       total_epochs=200,
+                                       steps_per_epoch=len(X_tr) // train_params['batch_size'])
 
         hist = model.fit(
             X_tr, y_tr,
             validation_data=(X_val, y_val),
             epochs=200,
             batch_size=train_params['batch_size'],
-            callbacks=[early, reduce, ckpt, warmup],
+            callbacks=[early, reduce, warmup],
             verbose=2)
 
         vloss = min(hist.history['val_loss'])
         fold_losses.append(vloss)
+
         if vloss < best_val:
             best_val = vloss
-            best_model = tf.keras.models.load_model(
-                f'final_best_fold_{fold}.keras',
-                custom_objects={'TransposeLayer': TransposeLayer})
+            best_model = tf.keras.models.clone_model(model)
+            best_model.set_weights(model.get_weights())
 
     print(f"\nK-Fold CV complete. Mean val loss: {np.mean(fold_losses):.6f} "
           f"± {np.std(fold_losses):.6f}")
 
-    # ---- Final model: retrain on FULL training data using best params ----
+    # ---- Retrain on FULL training data ----
     print("\nRetraining final model on FULL training data (1999–2020)...")
     with suppress_output():
         final_model = build_transformer(input_shape=(ws, fd), **model_params)
@@ -340,14 +363,13 @@ def train_final_kfold(model_params, train_params,
                                total_epochs=200,
                                steps_per_epoch=len(X_train_seq) // train_params['batch_size'])
 
-    final_model.fit(
+    final_hist = final_model.fit(
         X_train_seq, y_train_seq,
         epochs=200,
         batch_size=train_params['batch_size'],
         callbacks=[early, warmup],
         verbose=2)
 
-    # Use final_model for predictions
     best_model = final_model
 
     # ---- predictions -------------------------------------------------------
@@ -360,31 +382,49 @@ def train_final_kfold(model_params, train_params,
         y_te_true = y_scaler.inverse_transform(y_test_seq.reshape(-1, 1)).flatten()
 
     # ---- save CSV ----------------------------------------------------------
+    csv_path = f'{OUTPUT_PREFIX}_predictions.csv'
     results = pd.DataFrame({
-        'Date': np.concatenate([train_real_date_seq, test_real_date_seq]),
+        'Date': np.concatenate([train_date_seq, test_date_seq]),
         'Actual': np.concatenate([y_tr_true, y_te_true]),
         'Predicted': np.concatenate([tr_pred, te_pred]),
+        'all_dates': np.concatenate([train_date_seq, test_date_seq]),
+        'dates': np.concatenate([train_date_seq, test_date_seq]),
         'real_dates': np.concatenate([train_real_date_seq, test_real_date_seq])
     })
+    for c in ['Date', 'all_dates', 'dates']:
+        results[c] = pd.to_datetime(results[c],
+                                 errors='coerce').dt.strftime('%Y-%m-%d')
+    results['real_dates'] = pd.to_datetime(results['real_dates'],
+                                             errors='coerce').dt.strftime('%Y-%m-%d')
+    results.to_csv(csv_path, index=False, float_format='%.3f')
+    print(f"Predictions saved to: {csv_path}")
 
-    for col in ['Date', 'real_dates']:
-        results[col] = pd.to_datetime(results[col], errors='coerce').dt.strftime('%Y-%m-%d')
+    # ---- TRAINING/VALIDATION LOSS PLOT ------------------------------------
+    plt.figure(figsize=(10, 5))
+    plt.plot(final_hist.history['loss'], label='Train Loss (Full Train Set)')
+    if 'val_loss' in final_hist.history:
+        plt.plot(final_hist.history['val_loss'], label='Validation Loss') 
+    plt.title('Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    loss_plot_path = f'{OUTPUT_PREFIX}_training_loss.png'
+    plt.savefig(loss_plot_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    print(f"Loss curve saved to: {loss_plot_path}")
 
-    results.to_csv(
-        f'/home/ubuntu/DeepLearning/NW/{BEACH_NAME}_prediction.csv',
-        index=False,
-        float_format='%.3f'
-    )
+    # ---- MAIN TIME SERIES PLOT ---------------------------------------------
+    data = pd.read_csv(csv_path)
+    data['all_dates'] = pd.to_datetime(data['all_dates'],
+                                         format='%Y-%m-%d', errors='coerce')
+    data = data.dropna(subset=['all_dates'])
 
-    # ---- PLOTTING: YOUR EXACT PLOT -----------------------------------------
-    data = pd.read_csv(f'/home/ubuntu/DeepLearning/NW/{BEACH_NAME}_prediction.csv')
-    data['Date'] = pd.to_datetime(data['Date'], format='%Y-%m-%d', errors='coerce')
-    data = data.dropna(subset=['Date'])
+    filtered = data[data['all_dates'].isin(data['real_dates'].dropna())].copy()
+    filtered_data = filtered if not filtered.empty else data.copy()
 
-    filtered_data = data.copy()
-
-    train_data = filtered_data[filtered_data['Date'] <= '2020-12-31']
-    test_data = filtered_data[filtered_data['Date'] >= '2021-01-01']
+    train_data = filtered_data[filtered_data['all_dates'] <= '2020-12-31']
+    test_data = filtered_data[filtered_data['all_dates'] >= '2021-01-01']
 
     obs_train = train_data['Actual'].values
     yates_train = train_data['Predicted'].values
@@ -398,8 +438,8 @@ def train_final_kfold(model_params, train_params,
     norm_rmse_train = rmse_train / std_train_obs
     norm_std_train = std_train_yates / std_train_obs
     loss_train = np.sqrt((0 - norm_rmse_train) ** 2 +
-                         (1 - cc_train) ** 2 +
-                         (1 - norm_std_train) ** 2)
+                          (1 - cc_train) ** 2 +
+                          (1 - norm_std_train) ** 2)
 
     cc_test = np.corrcoef(obs_test, yates_test)[0, 1] if len(obs_test) > 1 else 0
     rmse_test = np.sqrt(mean_squared_error(obs_test, yates_test))
@@ -408,17 +448,19 @@ def train_final_kfold(model_params, train_params,
     norm_rmse_test = rmse_test / std_test_obs
     norm_std_test = std_test_yates / std_test_obs
     loss_test = np.sqrt((0 - norm_rmse_test) ** 2 +
-                        (1 - cc_test) ** 2 +
-                        (1 - norm_std_test) ** 2)
+                         (1 - cc_test) ** 2 +
+                         (1 - norm_std_test) ** 2)
 
+    filtered_data['Date'] = pd.to_datetime(filtered_data['Date'],
+                                           format='mixed', errors='coerce')
     plt.figure(figsize=(14, 6))
     plt.plot(filtered_data['Date'].values, filtered_data['Actual'].values,
-             label='Observation', color='blue')
+              label='Observation', color='blue')
     plt.plot(filtered_data['Date'].values, filtered_data['Predicted'].values,
-             label='iTransformer', color='red', linestyle='--', linewidth=1.5)
+              label='iTransformer', color='red', linestyle='--', linewidth=1.5)
 
     plt.axvspan(pd.Timestamp('2021-01-01'), pd.Timestamp('2025-02-07'),
-                color='gray', alpha=0.3, label='Prediction Period')
+                  color='gray', alpha=0.3, label='Prediction Period')
 
     plt.text(
         0.01, 1,
@@ -433,35 +475,36 @@ def train_final_kfold(model_params, train_params,
     )
 
     plt.ylabel('Shoreline Position')
-    plt.title(f'{BEACH_NAME}_KFold_iT_HPO')
-
+    plt.title('Muri_KFold_iT_HPO')
     plt.gca().xaxis.set_major_locator(mdates.YearLocator(3))
     plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
     plt.gcf().autofmt_xdate()
     plt.legend(loc='upper left', bbox_to_anchor=(0.15, 1))
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
-    plt.savefig(f'{BEACH_NAME}_time_series.png', dpi=300, bbox_inches='tight') 
+    ts_plot_path = f'{OUTPUT_PREFIX}_timeseries.png'
+    plt.savefig(ts_plot_path, dpi=300, bbox_inches='tight')
     plt.show()
+    print(f"Time series plot saved to: {ts_plot_path}")
 
     return best_model
 
 
 # ----------------------------------------------------------------------
-# 8. MAIN – 75/25 split for HPO, K-Fold for final evaluation
+# 8. MAIN
 # ----------------------------------------------------------------------
 def main():
     WINDOW_SIZE = 60
     N_TRIALS = 10
-    N_SPLITS = 4  # K-Fold
+    N_SPLITS = 4
 
-    print("Loading data …")
+    print("Loading data ...")
     with suppress_output():
+        # NOTE: Verify the path to your data file here!
         (X_train, X_test, y_train, y_test,
-         tr_dates, te_dates,
-         tr_real, te_real,
-         _, y_scaler) = load_and_preprocess_data(
-            '/home/ubuntu/DeepLearning/NW/Muriwai_smoothed.csv')
+          tr_dates, te_dates, tr_real, te_real,
+          _, y_scaler) = load_and_preprocess_data(
+             '/home/ubuntu/DeepLearning/NW/Muriwai_smoothed.csv')
 
         X_train_seq, y_train_seq, tr_date_seq, tr_real_seq = create_sequences(
             X_train, y_train, tr_dates, tr_real, WINDOW_SIZE)
@@ -485,17 +528,17 @@ def main():
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10))
 
     study.enqueue_trial({
-        'num_heads': 4, 'ff_dim': 32, 'num_layers': 2,
+        'num_heads': 2, 'ff_dim': 32, 'num_layers': 2,
         'dropout': 0.3, 'l2_lambda': 0.05, 'noise_std': 0.1,
-        'dense_units': 16, 'input_proj_dim': 6,
+        'input_proj_dim': 6, 'final_dense_units': 16,
         'initial_lr': 0.0005, 'batch_size': 256
     })
 
     study.optimize(
         lambda trial: objective(trial,
-                                X_tr_hpo, y_tr_hpo,
-                                X_val_hpo, y_val_hpo,
-                                WINDOW_SIZE, X_train_seq.shape[2]),
+                                 X_tr_hpo, y_tr_hpo,
+                                 X_val_hpo, y_val_hpo,
+                                 WINDOW_SIZE, X_train_seq.shape[2]),
         n_trials=N_TRIALS,
         show_progress_bar=True)
 
@@ -504,18 +547,29 @@ def main():
     for k, v in study.best_params.items():
         print(f"  {k}: {v}")
 
-    study.trials_dataframe().to_csv(f'{BEACH_NAME}_optuna_trials.csv', index=False)
+    optuna_csv = f'{OUTPUT_PREFIX}_optuna_trials.csv'
+    study.trials_dataframe().to_csv(optuna_csv, index=False)
+    print(f"Optuna trials saved to: {optuna_csv}")
 
     print("\n" + "=" * 60)
     print(f"FINAL {N_SPLITS}-FOLD EVALUATION ON TRAINING DATA")
     print("=" * 60)
 
-    model_params = {k: study.best_params[k] for k in
-                    ['num_heads', 'ff_dim', 'num_layers',
-                     'dropout', 'l2_lambda', 'noise_std', 'dense_units', 'input_proj_dim']}
+    model_params = {
+        'num_heads': study.best_params['num_heads'],
+        'ff_dim': study.best_params['ff_dim'],
+        'num_layers': study.best_params['num_layers'],
+        'dropout': study.best_params['dropout'],
+        'l2_lambda': study.best_params['l2_lambda'],
+        'noise_std': study.best_params['noise_std'],
+        'input_proj_dim': study.best_params['input_proj_dim'],
+        'final_dense_units': study.best_params['final_dense_units']
+    }
 
-    train_params = {'initial_lr': study.best_params['initial_lr'],
-                    'batch_size': study.best_params['batch_size']}
+    train_params = {
+        'initial_lr': study.best_params['initial_lr'],
+        'batch_size': study.best_params['batch_size']
+    }
 
     train_final_kfold(
         model_params=model_params,
