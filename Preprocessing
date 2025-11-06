@@ -1,0 +1,567 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import warnings
+import os
+import glob
+from pathlib import Path
+
+warnings.filterwarnings("ignore")
+
+# =================================================================
+# USER INPUT: DIRECTORIES & FILENAME
+# =================================================================
+# Root directory where folders starting with 'nzd' are located
+INPUT_ROOT = r"C:\Users\amgh628\Downloads\Shoreline_calssified\Updated"
+# Directory to save the final smoothed CSV and plot PNG files
+OUTPUT_DIR = r"C:\Users\amgh628\Downloads\Shoreline_calssified\Shoreline_smoothed"
+# The specific CSV file name inside each 'nzd*' folder
+INPUT_FILENAME = "transect_time_series.csv"
+# =================================================================
+
+# -------------------------------------------------
+# STYLE (using 'default' for robustness)
+# -------------------------------------------------
+plt.style.use('default') # Using 'default' to avoid potential issues with 'seaborn' versions
+
+# -------------------------------------------------
+# GARCIA SMOOTHING FUNCTIONS (smoothn)
+# --- (The rest of the smoothn function code is kept as is) ---
+# -------------------------------------------------
+import numpy.ma as ma
+from scipy.fftpack.realtransforms import dct, idct
+import scipy.optimize.lbfgsb as lbfgsb
+
+def dctND(data, f=dct):
+    nd = len(data.shape)
+    if nd == 1:
+        return f(data, norm='ortho', type=2)
+    elif nd == 2:
+        return f(f(data, norm='ortho', type=2).T, norm='ortho', type=2).T
+    elif nd == 3:
+        return f(f(f(data, norm='ortho', type=2, axis=0),
+                   norm='ortho', type=2, axis=1),
+                 norm='ortho', type=2, axis=2)
+    elif nd == 4:
+        return f(f(f(f(data, norm='ortho', type=2, axis=0),
+                     norm='ortho', type=2, axis=1),
+                   norm='ortho', type=2, axis=2),
+                 norm='ortho', type=2, axis=3)
+
+def RobustWeights(r, I, h, wstr):
+    MAD = np.median(np.abs(r[I] - np.median(r[I])))
+    u = np.abs(r / (1.4826 * MAD) / np.sqrt(1 - h))
+    if wstr == 'cauchy':
+        c = 2.385
+        W = 1. / (1 + (u / c) ** 2)
+    elif wstr == 'talworth':
+        c = 2.795
+        W = u < c
+    else:
+        c = 4.685
+        W = (1 - (u / c) ** 2) ** 2 * ((u / c) < 1)
+    W[np.isnan(W)] = 0
+    return W
+
+def gcv(p, Lambda, aow, DCTy, IsFinite, Wtot, y, nof, noe, smoothOrder):
+    s = 10 ** p
+    Gamma = 1. / (1 + (s * np.abs(Lambda)) ** smoothOrder)
+    if aow > 0.9:
+        RSS = np.linalg.norm(DCTy * (Gamma - 1.)) ** 2
+    else:
+        yhat = dctND(Gamma * DCTy, f=idct)
+        RSS = np.linalg.norm(np.sqrt(Wtot[IsFinite]) * (y[IsFinite] - yhat[IsFinite])) ** 2
+    TrH = np.sum(Gamma)
+    GCVscore = RSS / float(nof) / (1. - TrH / float(noe)) ** 2
+    return GCVscore
+
+def smoothn(y, nS0=10, axis=None, smoothOrder=2.0, sd=None, verbose=False,
+            s0=None, z0=None, isrobust=False, W=None, s=None, MaxIter=100,
+            TolZ=1e-3, weightstr='bisquare'):
+    if isinstance(y, ma.core.MaskedArray):
+        is_masked = True
+        mask = y.mask
+        y = np.array(y)
+        y[mask] = 0.
+        if W is not None:
+            W = np.array(W)
+            W[mask] = 0.
+        if sd is not None:
+            W = np.array(1. / sd ** 2)
+            W[mask] = 0.
+            sd = None
+        y[mask] = np.nan
+    if sd is not None:
+        sd_ = np.array(sd)
+        mask = (sd_ > 0.)
+        W = np.zeros_like(sd_)
+        W[mask] = 1. / sd_[mask] ** 2
+        sd = None
+    if W is not None:
+        W = W / W.max()
+    sizy = y.shape
+    if axis is None:
+        axis = tuple(np.arange(y.ndim))
+    noe = y.size
+    if noe < 2:
+        z = y
+        exitflag = 0
+        Wtot = 0
+        return z, s, exitflag, Wtot
+    if W is None:
+        W = np.ones(sizy)
+    Wtot = W
+    IsFinite = np.array(np.isfinite(y)).astype(bool)
+    nof = IsFinite.sum()
+    Wtot = Wtot * IsFinite
+    if np.any(Wtot < 0):
+        raise RuntimeError('smoothn:NegativeWeights', 'Weights must all be >=0')
+    isweighted = np.any(Wtot != 1)
+    isauto = s is None
+    Lambda = np.zeros(sizy)
+    for i in axis:
+        siz0 = np.ones((1, y.ndim))[0].astype(int)
+        siz0[i] = sizy[i]
+        Lambda = Lambda + (np.cos(np.pi * (np.arange(1, sizy[i] + 1) - 1.) / sizy[i]).reshape(siz0))
+    Lambda = -2. * (len(axis) - Lambda)
+    if not isauto:
+        Gamma = 1. / (1 + (s * np.abs(Lambda)) ** smoothOrder)
+    N = np.sum(np.array(sizy) != 1)
+    hMin = 1e-6
+    hMax = 0.99
+    try:
+        sMinBnd = np.sqrt((((1 + np.sqrt(1 + 8 * hMax ** (2. / N))) / 4. / hMax ** (2. / N)) ** 2 - 1) / 16.)
+        sMaxBnd = np.sqrt((((1 + np.sqrt(1 + 8 * hMin ** (2. / N))) / 4. / hMin ** (2. / N)) ** 2 - 1) / 16.)
+    except:
+        sMinBnd = None
+        sMaxBnd = None
+    if isweighted:
+        if z0 is not None:
+            z = z0
+        else:
+            z = y
+            z[~IsFinite] = 0.
+    else:
+        z = np.zeros(sizy)
+    z0 = z
+    y[~IsFinite] = 0
+    tol = 1.
+    RobustIterativeProcess = True
+    RobustStep = 1
+    nit = 0
+    errp = 0.1
+    RF = 1 + 0.75 * isweighted
+    if isauto:
+        try:
+            xpost = np.array([(0.9 * np.log10(sMinBnd) + np.log10(sMaxBnd) * 0.1)])
+        except:
+            xpost = np.array([100.])
+    else:
+        xpost = np.array([np.log10(s)])
+    while RobustIterativeProcess:
+        aow = np.sum(Wtot) / noe
+        while tol > TolZ and nit < MaxIter:
+            if verbose:
+                print('tol', tol, 'nit', nit)
+            nit = nit + 1
+            DCTy = dctND(Wtot * (y - z) + z, f=dct)
+            if isauto and not np.remainder(np.log2(nit), 1):
+                if not s0:
+                    ss = np.arange(nS0) * (1. / (nS0 - 1.)) * (np.log10(sMaxBnd) - np.log10(sMinBnd)) + np.log10(sMinBnd)
+                    g = np.zeros_like(ss)
+                    for i, p in enumerate(ss):
+                        g[i] = gcv(p, Lambda, aow, DCTy, IsFinite, Wtot, y, nof, noe, smoothOrder)
+                    xpost = [ss[g == g.min()]]
+                else:
+                    xpost = [s0]
+                xpost, f, d = lbfgsb.fmin_l_bfgs_b(
+                    gcv, xpost, fprime=None, factr=1e7,
+                    approx_grad=True, bounds=[(np.log10(sMinBnd), np.log10(sMaxBnd))],
+                    args=(Lambda, aow, DCTy, IsFinite, Wtot, y, nof, noe, smoothOrder))
+            s = 10 ** xpost[0]
+            s0 = xpost[0]
+            Gamma = 1. / (1 + (s * np.abs(Lambda)) ** smoothOrder)
+            z = RF * dctND(Gamma * DCTy, f=idct) + (1 - RF) * z
+            tol = isweighted * np.linalg.norm(z0 - z) / np.linalg.norm(z)
+            z0 = z
+        exitflag = nit < MaxIter
+        if isrobust:
+            h = np.sqrt(1 + 16. * s)
+            h = np.sqrt(1 + h) / np.sqrt(2) / h
+            h = h ** N
+            Wtot = Wtot * RobustWeights(y - z, IsFinite, h, weightstr)
+            isweighted = True
+            tol = 1
+            nit = 0
+            RobustStep = RobustStep + 1
+            RobustIterativeProcess = RobustStep < 3
+        else:
+            RobustIterativeProcess = False
+    if isauto:
+        if np.abs(np.log10(s) - np.log10(sMinBnd)) < errp:
+            print(f"s = {s:.3f}: the lower bound for s has been reached.")
+        elif np.abs(np.log10(s) - np.log10(sMaxBnd)) < errp:
+            print(f"s = {s:.3f}: the upper bound for s has been reached.")
+    return z, s, exitflag, Wtot
+
+# -------------------------------------------------
+# MAIN BATCH PROCESSING LOOP
+# -------------------------------------------------
+
+# Ensure output directory exists
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# Find all relevant folders
+search_path = os.path.join(INPUT_ROOT, "nzd*")
+nzd_folders = sorted(glob.glob(search_path))
+
+if not nzd_folders:
+    print(f"🛑 No folders starting with 'nzd' found in {INPUT_ROOT}")
+
+# Iterate through each nzd folder
+for folder_path in nzd_folders:
+    beach_number = os.path.basename(folder_path).replace('nzd', '')
+    input_file_path = os.path.join(folder_path, INPUT_FILENAME)
+    
+    print("\n" + "="*80)
+    print(f"Processing BEACH {beach_number} from: {input_file_path}")
+    print("="*80)
+
+    # 2. LOAD DATA
+    try:
+        # Load CSV, assume first column is date/time, and second column onwards are transect data
+        df = pd.read_csv(input_file_path, index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        print(f"❌ ERROR: File not found: {input_file_path}. Skipping.")
+        continue
+    except Exception as e:
+        print(f"❌ ERROR: Could not read {input_file_path}. Skipping. Error: {e}")
+        continue
+    
+    # === ADJUSTMENT: IGNORE 'satname' COLUMN ===
+    df = df.drop(columns=['satname'], errors='ignore')
+    # ==========================================
+
+    df.index.name = 'dates'
+    
+    # Check if the dataframe is empty after loading
+    if df.empty:
+        print(f"⚠️ WARNING: DataFrame is empty in {input_file_path}. Skipping.")
+        continue
+
+    # Identify transect columns (all remaining columns after dropping 'satname')
+    transect_cols = df.columns.tolist()
+    if not transect_cols:
+        print(f"⚠️ WARNING: No transect columns found after dropping 'satname'. Skipping.")
+        continue
+    data_raw = df[transect_cols].copy()
+    print(f" • Initial transects: {len(transect_cols)}")
+
+    # -------------------------------------------------
+    # 3. STEP 1: OUTLIER DETECTION & INTERPOLATION (Z > 4)
+    # -------------------------------------------------
+    print(" • Step 1: Detecting outliers (Z-score > 5) per transect...")
+    data_clean = data_raw.copy()
+    outlier_count = 0
+    for col in data_clean.columns:
+        series = data_clean[col]
+        if series.std() == 0 or len(series) < 2:
+            continue
+        z = np.abs((series - series.mean()) / series.std())
+        outliers = z > 5
+        if outliers.any():
+            n_out = outliers.sum()
+            outlier_count += n_out
+            # print(f" → {col}: {n_out} outlier(s) → interpolating") # too verbose for batch
+            series.loc[outliers] = np.nan # Use .loc for assignment
+        data_clean[col] = series
+    data_clean = data_clean.interpolate(method='time', limit_direction='both')
+    print(f" • Total outliers corrected: {outlier_count}")
+
+    # -------------------------------------------------
+    # 4. STEP 2: REMOVE LOW‑CORRELATION TRANSECTS (mean corr < 0.3)
+    # -------------------------------------------------
+    print(" • Step 2: Removing transects with low correlation (mean < 0.3)...")
+    corr_matrix = data_clean.corr()
+    mean_corr = corr_matrix.mean()
+    # Handle NaN in mean_corr for columns with all NaNs after initial steps
+    mean_corr = mean_corr.fillna(0) 
+    low_corr = mean_corr[mean_corr < 0.3]
+    low_corr_count = 0 # Initialize for the summary
+    if len(low_corr) > 0:
+        low_corr_count = len(low_corr)
+        print(f" → Removing {low_corr_count} transect(s): {list(low_corr.index)}")
+        data_clean = data_clean.drop(columns=low_corr.index)
+    else:
+        print(" → All transects have mean corr ≥ 0.3")
+    
+    transect_cols = data_clean.columns.tolist()
+    print(f" • Using {len(transect_cols)} transects after correlation filter")
+
+    # Final check before PCA
+    if len(transect_cols) < 2:
+        print(f"❌ ERROR: Not enough transects ({len(transect_cols)}) after filtering for PCA. Need ≥2. Skipping.")
+        continue
+
+    # -------------------------------------------------
+    # 5. FINAL INTERPOLATION (NO LARGE‑GAP FILL)
+    # -------------------------------------------------
+    # Fill any remaining NaNs with interpolation, then forward/backward fill
+    data_interp = data_clean.interpolate(method='time').bfill().ffill()
+
+    # -------------------------------------------------
+    # 6. HANDLE DUPLICATE DATES
+    # -------------------------------------------------
+    print(" • Averaging duplicate dates...")
+    n_before = len(data_interp)
+    # Group by date part of the index (assuming index is already datetime)
+    data_interp = data_interp.groupby(data_interp.index.date).mean()
+    data_interp.index = pd.to_datetime(data_interp.index)
+    n_after = len(data_interp)
+    print(f" → {n_before} → {n_after} unique dates")
+
+    # -------------------------------------------------
+    # 7. ANOMALY + PCA
+    # -------------------------------------------------
+    try:
+        mean_profile = data_interp.mean(axis=0)
+        data_anomaly = data_interp - mean_profile.values
+        pca = PCA()
+        pcs = pca.fit_transform(data_anomaly)
+        eofs = pca.components_
+        var_expl = pca.explained_variance_ratio_
+        cum_var = np.cumsum(var_expl)
+    except ValueError as e:
+        print(f"❌ ERROR during PCA for Beach {beach_number}. Skipping. Error: {e}")
+        continue
+
+
+    # -------------------------------------------------
+    # 8. SELECT MODES: ≥60% VARIANCE
+    # -------------------------------------------------
+    thresh = 0.60
+    # Check if cum_var is empty (shouldn't happen if data_interp has >=2 columns and is not empty)
+    if len(cum_var) == 0:
+        print(f"❌ ERROR: PCA resulted in no variance explained for Beach {beach_number}. Skipping.")
+        continue
+        
+    # Find the number of modes needed
+    try:
+        n_modes = np.argmax(cum_var >= thresh) + 1
+    except:
+        n_modes = len(cum_var) # Failsafe: use all modes
+
+    # Refine n_modes logic:
+    if n_modes == 0 and cum_var[-1] < thresh:
+        n_modes = len(cum_var)
+        print(f" • WARNING: Only {cum_var[-1]*100:.1f}% total variance. Using all modes ({n_modes}).")
+    elif n_modes == 0: # Case where argmax returns 0 but variance is > thresh (unlikely with correct cum_var)
+        n_modes = 1 
+        print(f" • Using {n_modes} mode(s) → {cum_var[n_modes-1]*100:.1f}% variance")
+    else:
+        print(f" • Using {n_modes} mode(s) → {cum_var[n_modes-1]*100:.1f}% variance")
+    
+    # Adjust n_modes if it exceeds the available components
+    if n_modes > len(eofs):
+        n_modes = len(eofs)
+
+    # -------------------------------------------------
+    # 9. RECONSTRUCT
+    # -------------------------------------------------
+    recon_full = np.zeros_like(data_anomaly)
+    for i in range(n_modes):
+        recon_full += np.outer(pcs[:, i], eofs[i, :])
+    recon_full += mean_profile.values
+    shoreline_survey = recon_full.mean(axis=1)
+    dates_survey = data_interp.index
+
+    # -------------------------------------------------
+    # 10. DAILY + SPLIT-YEAR GARCIA SMOOTHING (1999–2020 & 2021–end)
+    # -------------------------------------------------
+    if dates_survey.empty:
+        print(f"❌ ERROR: Dates survey is empty for Beach {beach_number}. Skipping.")
+        continue
+
+    start_date = dates_survey.min().normalize()
+    # end_date needs to be strictly greater than max date for daily_index range
+    end_date = dates_survey.max().normalize() + pd.Timedelta(days=1) 
+    
+    # Check for valid date range
+    if start_date >= end_date:
+        print(f"❌ ERROR: Invalid date range (start_date >= end_date) for Beach {beach_number}. Skipping.")
+        continue
+
+    daily_index = pd.date_range(start=start_date, end=end_date, freq='D')
+
+    df_survey = pd.DataFrame({'shoreline': shoreline_survey}, index=dates_survey)
+    df_daily = df_survey.reindex(daily_index)
+    df_daily['shoreline_daily'] = df_daily['shoreline'].interpolate(method='time')
+
+    # ---- Split at 2021-01-01 -------------------------------------------------
+    split_date = pd.Timestamp('2021-01-01')
+    mask_pre = df_daily.index < split_date
+    mask_post = df_daily.index >= split_date
+
+    y_pre = df_daily.loc[mask_pre, 'shoreline_daily'].to_numpy()
+    y_post = df_daily.loc[mask_post, 'shoreline_daily'].to_numpy()
+    
+    # Handle empty segments
+    smoothed_pre = np.array([])
+    smoothed_post = np.array([])
+
+    if len(y_pre) > 1: # smoothn needs at least 2 points
+        smoothed_pre, _, _, _ = smoothn(y_pre, isrobust=True, s=500)
+    elif len(y_pre) == 1:
+        smoothed_pre = y_pre
+        
+    if len(y_post) > 1: # smoothn needs at least 2 points
+        smoothed_post, _, _, _ = smoothn(y_post, isrobust=True, s=500)
+    elif len(y_post) == 1:
+        smoothed_post = y_post
+
+    # Recombine (handle cases where one or both parts were empty or single-point)
+    smoothed = np.concatenate([smoothed_pre, smoothed_post])
+    
+    if len(smoothed) != len(df_daily):
+        print(f"❌ ERROR: Smoothed array length mismatch for Beach {beach_number}. Skipping.")
+        continue
+        
+    df_daily['shoreline_smoothed'] = smoothed
+    # -------------------------------------------------------------------
+
+    # -------------------------------------------------
+    # 11. SAVE WITH BEACH NUMBER – ADD real_date COLUMN (DD/MM/YYYY)
+    # -------------------------------------------------
+    prefix = f"{beach_number}_"
+    final_file_name = prefix + "shoreline_smoothed.csv"
+    final_file_path = os.path.join(OUTPUT_DIR, final_file_name)
+
+    final_df = df_daily[['shoreline_smoothed']].copy()
+    final_df.columns = ['shoreline_smoothed']
+
+    # Add 'real_date': only original survey dates
+    real_dates = pd.Series(index=df_daily.index, dtype='object')
+    # Use .index.intersection to ensure dates_survey are present in df_daily index
+    intersection_dates = df_daily.index.intersection(dates_survey) 
+    real_dates.loc[intersection_dates] = intersection_dates 
+    final_df['real_date'] = real_dates
+
+    # === FORMAT real_date as DD/MM/YYYY (dayfirst) ===
+    # Convert all non-NaT values to DD/MM/YYYY string format
+    final_df['real_date'] = final_df['real_date'].apply(
+        lambda x: x.strftime('%d/%m/%Y') if pd.notna(x) else np.nan
+    )
+    # =================================================
+
+    # Reorder: real_date first, then shoreline
+    final_df = final_df[['real_date', 'shoreline_smoothed']]
+
+    # Name index and save
+    final_df.index.name = 'date'
+    final_df.to_csv(final_file_path)
+    print(f"\nFINAL FILE → {final_file_path}")
+
+    # -------------------------------------------------
+    # 12. CLEAN EOF SUMMARY
+    # -------------------------------------------------
+    print("\n" + "="*60)
+    print(f"BEACH {beach_number} – EOF SUMMARY")
+    print("="*60)
+    
+    # Re-calculate or check summary variables for current beach
+    current_cum_var = cum_var[:n_modes] 
+    current_var_expl = var_expl[:n_modes]
+    
+    for i in range(min(n_modes, 3)):
+        print(f" EOF {i+1}: {current_var_expl[i]*100:5.2f}%")
+        
+    variance_cap = current_cum_var[-1]*100 if n_modes > 0 else 0.0
+        
+    if n_modes > 3:
+        print(f" ... + {n_modes-3} more → total {variance_cap:.1f}%")
+    elif n_modes > 0:
+        print(f" Total captured: {variance_cap:.1f}%")
+    else:
+        print(" Total captured: 0.0%")
+        
+    print("="*60)
+
+    # -------------------------------------------------
+    # 13. PLOT WITH SUMMARY TEXT IN TOP‑RIGHT OF SECOND SUBPLOT
+    # -------------------------------------------------
+    fig = plt.figure(figsize=(16, 10))
+    fig.suptitle(f"Beach {beach_number} – Final Representative Shoreline (Split Smoothing)", fontsize=16, y=0.98)
+
+    # --- Main Time Series ---
+    ax1 = plt.subplot(2, 1, 1)
+    ax1.plot(df_daily.index, df_daily['shoreline_daily'], color='orange', alpha=0.7,
+              linewidth=1, label='Daily (interpolated)')
+    ax1.plot(final_df.index, final_df['shoreline_smoothed'],
+              color='green', linewidth=2.5, label='Garcia-smoothed (split 2021)')
+    ax1.scatter(dates_survey, shoreline_survey, color='red', s=15, zorder=5,
+                label='Surveys')
+    ax1.axvline(split_date, color='black', linestyle='--', alpha=0.6, label='Split: 2021-01-01')
+    ax1.set_ylabel('Shoreline [m]')
+    
+    ax1.set_title(f'{n_modes} EOFs → ≥{thresh*100:.0f}% Variance')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # --- Variance Explained ---
+    ax2 = plt.subplot(2, 1, 2)
+    n_plot = min(10, len(var_expl))
+    modes = np.arange(1, n_plot + 1)
+    
+    # Only plot if there is data
+    if n_plot > 0:
+        ax2.bar(modes, var_expl[:n_plot]*100, color='steelblue', alpha=0.8)
+        ax2.plot(modes, cum_var[:n_plot]*100, 'r-o', linewidth=2, label='Cumulative')
+        ax2.axhline(thresh*100, color='black', linestyle='--', label=f'{thresh*100:.0f}%')
+    
+    ax2.set_xlabel('EOF Mode')
+    ax2.set_ylabel('Variance (%)')
+    ax2.set_title('Variance Explained')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # --- ADD SUMMARY TEXT IN TOP‑RIGHT OF SECOND SUBPLOT (ax2) ---
+    summary_text = (
+        f"Outliers corrected (Z>5) : {outlier_count}\n"
+        f"Low-corr removed (<0.3) : {low_corr_count}\n"
+        f"Transects used : {len(transect_cols)}\n"
+        f"EOF modes : {n_modes}\n"
+        f"Variance captured : {variance_cap:.1f}%\n"
+        f"Smoothing: Split at 2021"
+    )
+    ax2.text(0.98, 0.98, summary_text,
+             transform=ax2.transAxes,
+             fontsize=12,
+             horizontalalignment='right',
+             verticalalignment='top',
+             bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.9),
+             fontfamily='monospace')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.94])
+    plot_file_name = prefix + "representative_shoreline_split.png"
+    plot_file_path = os.path.join(OUTPUT_DIR, plot_file_name)
+    plt.savefig(plot_file_path, dpi=200, bbox_inches='tight')
+    plt.close(fig) # Close the figure to free memory
+    print(f"Plot → {plot_file_path}")
+
+    # -------------------------------------------------
+    # 14. FINAL CONSOLE SUMMARY
+    # -------------------------------------------------
+    print("\n" + "="*60)
+    print(f"BEACH {beach_number} – DONE (Split Smoothing)")
+    print("="*60)
+    print(f"• Outliers corrected : {outlier_count}")
+    print(f"• Low-corr removed  : {low_corr_count}")
+    print(f"• Transects used : {len(transect_cols)}")
+    print(f"• EOF modes : {n_modes}")
+    print(f"• Variance captured : {variance_cap:.1f}%")
+    print(f"• Smoothing: 1999–2020 and 2021–end separately")
+    print(f"• real_date format: DD/MM/YYYY")
+    print(f"• FINAL FILE : {final_file_path}")
+
+print("\n\n✅ Batch processing complete!")
