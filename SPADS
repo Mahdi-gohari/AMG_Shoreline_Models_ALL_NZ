@@ -1,0 +1,1053 @@
+# BATCH SPADS RUNNER WITH FREQUENCY THRESHOLD TUNING + WEIGHTED ENSEMBLE
+# ==============================================================
+# FEATURES:
+# - Performance-weighted ensemble for combining noise levels
+# - Frequency threshold tuning (finds optimal value per beach)
+# - CC-based selection (better generalization to test data)
+# - Reproducibility with fixed random seed
+# ==============================================================
+#Final
+import os
+import shutil
+from pathlib import Path
+import pandas as pd
+from tqdm import tqdm
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from sklearn.metrics import mean_squared_error
+import xarray as xr
+import cftime
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==============================================================
+# REPRODUCIBILITY - Set seeds BEFORE importing pySPADS
+# ==============================================================
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+random.seed(RANDOM_SEED)
+
+# --- pySPADS ---
+from pySPADS.processing.trend import detect_trend, gen_trend
+from pySPADS.pipeline import steps
+from pySPADS.processing.data import imf_filename, load_imfs
+from pySPADS.processing.dataclasses import TrendModel
+
+# ==============================================================
+# 0. GLOBAL CONFIGURATION
+# ==============================================================
+PARENT_DIR = Path(r"C:\Users\amgh628\Downloads\Shoreline_calssified")
+REGION_DIRS = ["SW_new2", "SE_new","NW_new","NE_new"] 
+WAVE_NC_PATH = PARENT_DIR / "NZ_wave_coastal_daily_merged.nc"
+
+OUTPUT_DIR = PARENT_DIR / "SPADS_tuned_all"
+
+time_col = "date"
+signal = "shoreline_smoothed"
+WAVE_VARS = ['hs', 'ptp1', 'dpm']
+
+ALL_METRICS = []
+
+# ==============================================================
+# TUNING CONFIGURATION
+# ==============================================================
+# Frequency thresholds to test (original default was 0.25)
+FREQ_THRESHOLDS_TO_TEST = [0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.50]
+
+# Noise levels
+NOISE_LEVELS = [0.1, 0.2, 0.3, 0.4, 0.5]
+
+# Number of trials for EMD decomposition
+NUM_TRIALS = 100
+
+# Use parallel processing (set to False for exact reproducibility)
+USE_PARALLEL = True  # False = slower but reproducible; True = faster but may vary
+
+# Selection criterion for frequency threshold tuning
+# Options: 'cc' (correlation coefficient) or 'loss' (combined metric)
+SELECTION_CRITERION = 'cc'  # 'cc' generalizes better to test data
+
+# ==============================================================
+# HELPER FUNCTIONS
+# ==============================================================
+def to_numpy_safe(data):
+    """Safely convert DataFrame, Series, or array to numpy array."""
+    if data is None:
+        return np.array([])
+    
+    if isinstance(data, pd.DataFrame):
+        if data.shape[1] == 1:
+            return data.iloc[:, 0].values.astype(float)
+        else:
+            return data.sum(axis=1).values.astype(float)
+    elif isinstance(data, pd.Series):
+        return data.values.astype(float)
+    elif isinstance(data, np.ndarray):
+        return data.astype(float)
+    else:
+        try:
+            return np.array(data, dtype=float)
+        except:
+            return np.array([])
+
+
+def get_prediction_series(pred_data, index=None):
+    """Convert pySPADS prediction output to a pandas Series."""
+    if isinstance(pred_data, pd.DataFrame):
+        if pred_data.shape[1] == 1:
+            series = pred_data.iloc[:, 0]
+        else:
+            series = pred_data.sum(axis=1)
+        series.name = 'prediction'
+        return series
+    elif isinstance(pred_data, pd.Series):
+        return pred_data
+    else:
+        if index is not None:
+            return pd.Series(np.array(pred_data).flatten(), index=index, name='prediction')
+        else:
+            return pd.Series(np.array(pred_data).flatten(), name='prediction')
+
+
+def calculate_performance_metrics(obs, pred):
+    """Calculate CC, NRMSE, NormStd, and Loss for given observations and predictions."""
+    obs_vals = to_numpy_safe(obs)
+    pred_vals = to_numpy_safe(pred)
+    
+    if len(obs_vals) < 2 or len(pred_vals) < 2:
+        return {'cc': np.nan, 'rmse': np.nan, 'nrmse': np.nan, 'norm_std': np.nan, 'loss': np.nan}
+    
+    valid_mask = np.isfinite(obs_vals) & np.isfinite(pred_vals)
+    obs_vals = obs_vals[valid_mask]
+    pred_vals = pred_vals[valid_mask]
+    
+    if len(obs_vals) < 2:
+        return {'cc': np.nan, 'rmse': np.nan, 'nrmse': np.nan, 'norm_std': np.nan, 'loss': np.nan}
+    
+    epsilon = 1e-6
+    cc = np.corrcoef(obs_vals, pred_vals)[0, 1]
+    rmse = np.sqrt(np.mean((obs_vals - pred_vals) ** 2))
+    std_obs = np.std(obs_vals) if np.std(obs_vals) > epsilon else 1.0
+    std_pred = np.std(pred_vals) if np.std(pred_vals) > epsilon else 1.0
+    nrmse = rmse / std_obs
+    norm_std = std_pred / std_obs
+    loss = np.sqrt((0 - nrmse)**2 + (1 - cc)**2 + (1 - norm_std)**2)
+    
+    return {
+        'cc': float(cc),
+        'rmse': float(rmse),
+        'nrmse': float(nrmse),
+        'norm_std': float(norm_std),
+        'loss': float(loss)
+    }
+
+
+# ==============================================================
+# PERFORMANCE-WEIGHTED ENSEMBLE FUNCTIONS
+# ==============================================================
+def calculate_noise_weights(component_predictions, original_signal, train_start, train_end, 
+                            weight_method='correlation_squared'):
+    """Calculate performance-based weights for each noise level."""
+    weights = {}
+    metrics = {}
+    epsilon = 1e-6
+    
+    for noise, preds in component_predictions.items():
+        try:
+            pred_series = get_prediction_series(preds)
+            train_pred = pred_series.loc[train_start:train_end]
+            train_obs = original_signal.loc[train_start:train_end]
+            common_idx = train_pred.index.intersection(train_obs.index)
+            
+            if len(common_idx) < 10:
+                weights[noise] = 0.0
+                metrics[noise] = {'cc': np.nan, 'rmse': np.nan, 'nrmse': np.nan, 'norm_std': np.nan}
+                continue
+            
+            pred_vals = to_numpy_safe(train_pred.loc[common_idx])
+            obs_vals = to_numpy_safe(train_obs.loc[common_idx])
+            
+            valid_mask = np.isfinite(pred_vals) & np.isfinite(obs_vals)
+            if valid_mask.sum() < 10:
+                weights[noise] = 0.0
+                metrics[noise] = {'cc': np.nan, 'rmse': np.nan, 'nrmse': np.nan, 'norm_std': np.nan}
+                continue
+            
+            pred_clean = pred_vals[valid_mask]
+            obs_clean = obs_vals[valid_mask]
+            
+            cc = np.corrcoef(obs_clean, pred_clean)[0, 1]
+            rmse = np.sqrt(np.mean((obs_clean - pred_clean) ** 2))
+            std_obs = np.std(obs_clean) if np.std(obs_clean) > epsilon else 1.0
+            std_pred = np.std(pred_clean) if np.std(pred_clean) > epsilon else 1.0
+            nrmse = rmse / std_obs
+            norm_std = std_pred / std_obs
+            
+            metrics[noise] = {
+                'cc': round(float(cc), 4),
+                'rmse': round(float(rmse), 4),
+                'nrmse': round(float(nrmse), 4),
+                'norm_std': round(float(norm_std), 4)
+            }
+            
+            if np.isnan(cc):
+                weights[noise] = 0.0
+            elif weight_method == 'correlation_squared':
+                weights[noise] = max(0, cc) ** 2
+            elif weight_method == 'correlation':
+                weights[noise] = max(0, cc)
+            elif weight_method == 'inverse_rmse':
+                weights[noise] = 1.0 / (rmse + epsilon)
+            elif weight_method == 'combined':
+                weights[noise] = max(0, cc) / (rmse + epsilon)
+            elif weight_method == 'loss_based':
+                loss = np.sqrt((0 - nrmse)**2 + (1 - cc)**2 + (1 - norm_std)**2)
+                weights[noise] = 1.0 / (loss + epsilon)
+            else:
+                weights[noise] = max(0, cc) ** 2
+                
+        except Exception as e:
+            weights[noise] = 0.0
+            metrics[noise] = {'cc': np.nan, 'rmse': np.nan, 'nrmse': np.nan, 'norm_std': np.nan}
+    
+    total_weight = sum(weights.values())
+    if total_weight < epsilon:
+        n_noises = len(component_predictions)
+        weights = {n: 1.0 / n_noises for n in component_predictions}
+    else:
+        weights = {n: w / total_weight for n, w in weights.items()}
+    
+    return weights, metrics
+
+
+def weighted_combine_predictions(component_predictions, weights, trend=None):
+    """Combine predictions using performance-based weights."""
+    combined = None
+    combined_index = None
+    
+    for noise, preds in component_predictions.items():
+        weight = weights.get(noise, 0.0)
+        if weight <= 0:
+            continue
+        
+        pred_series = get_prediction_series(preds)
+        
+        if combined is None:
+            combined = pred_series.values.astype(float) * weight
+            combined_index = pred_series.index
+        else:
+            common_idx = combined_index.intersection(pred_series.index)
+            new_combined = np.zeros(len(common_idx))
+            
+            for i, idx in enumerate(common_idx):
+                old_pos = list(combined_index).index(idx)
+                new_combined[i] = combined[old_pos]
+            
+            pred_vals = pred_series.loc[common_idx].values.astype(float)
+            new_combined = new_combined + pred_vals * weight
+            
+            combined = new_combined
+            combined_index = common_idx
+    
+    if combined is not None:
+        result = pd.Series(combined, index=combined_index, name='prediction')
+        if trend is not None:
+            trend_values = gen_trend(result, trend)
+            result = result + trend_values
+        return result
+    else:
+        return pd.Series(dtype=float, name='prediction')
+
+
+def log_weights(beach_id, weights, metrics, spads_folder):
+    """Log the weights and metrics."""
+    log_data = []
+    for noise in sorted(weights.keys()):
+        row = {
+            'beach_id': beach_id,
+            'noise_level': noise,
+            'weight': round(weights[noise], 4),
+            **metrics.get(noise, {})
+        }
+        log_data.append(row)
+    
+    log_df = pd.DataFrame(log_data)
+    log_path = spads_folder / f"{beach_id}_noise_weights.csv"
+    log_df.to_csv(log_path, index=False)
+    
+    print("\n--- Noise Level Weights ---")
+    print(f"{'Noise':<8} {'Weight':<10} {'CC':<10} {'NRMSE':<10}")
+    print("-" * 38)
+    for noise in sorted(weights.keys()):
+        m = metrics.get(noise, {})
+        cc_val = m.get('cc', np.nan)
+        nrmse_val = m.get('nrmse', np.nan)
+        cc_str = f"{cc_val:.4f}" if not np.isnan(cc_val) else 'N/A'
+        nrmse_str = f"{nrmse_val:.4f}" if not np.isnan(nrmse_val) else 'N/A'
+        print(f"{noise:<8} {weights[noise]:<10.4f} {cc_str:<10} {nrmse_str:<10}")
+    print("-" * 38)
+
+
+# ==============================================================
+# FREQUENCY THRESHOLD TUNING
+# ==============================================================
+def tune_frequency_threshold(imfs_by_noise, dfs, signal, original_signal_df, signal_trend,
+                             train_start, train_end, driver_end, noises, 
+                             freq_thresholds, weight_method='correlation_squared',
+                             exclude_trend=True, normalize_drivers=False,
+                             selection_criterion='cc'):
+    """
+    Test multiple frequency thresholds and return the best one.
+    
+    Parameters:
+    -----------
+    selection_criterion : str
+        'cc' = select threshold with highest correlation (better generalization)
+        'loss' = select threshold with lowest loss (may overfit)
+    
+    Returns:
+    --------
+    best_threshold : float
+    best_predictions : dict (component predictions for best threshold)
+    tuning_results : list of dicts with performance for each threshold
+    """
+    print("\n" + "=" * 60)
+    print("FREQUENCY THRESHOLD TUNING")
+    print(f"Selection criterion: {selection_criterion.upper()}")
+    print("=" * 60)
+    
+    tuning_results = []
+    best_threshold = 0.25  # Default
+    best_loss = float('inf')
+    best_cc = -float('inf')
+    best_predictions = None
+    
+    for freq_thresh in tqdm(freq_thresholds, desc="Testing freq thresholds"):
+        try:
+            # Reset seed for each threshold to ensure fair comparison
+            np.random.seed(RANDOM_SEED)
+            random.seed(RANDOM_SEED)
+            
+            # Run SPADS with this frequency threshold
+            nearest_freqs = {}
+            coefficients = {}
+            component_predictions = {}
+            
+            for noise in noises:
+                full = imfs_by_noise[noise]
+                imfs_train = {lab: df.loc[train_start:train_end] for lab, df in full.items()}
+                
+                nearest_freqs[noise] = steps.match_frequencies(
+                    imfs_train, signal, freq_thresh, exclude_trend
+                )
+                coefficients[noise] = steps.fit(
+                    imfs_train, nearest_freqs[noise], signal,
+                    model="mreg2", fit_intercept=True, normalize=normalize_drivers
+                )
+                preds = steps.predict(
+                    full, nearest_freqs[noise], signal,
+                    coefficients[noise], train_start, driver_end,
+                    exclude_trend=exclude_trend
+                )
+                component_predictions[noise] = preds
+            
+            # Calculate weights for this configuration
+            detrended_signal = dfs[signal].copy()
+            weights, _ = calculate_noise_weights(
+                component_predictions, detrended_signal,
+                train_start, train_end, weight_method=weight_method
+            )
+            
+            # Combine predictions with weights
+            combined = weighted_combine_predictions(component_predictions, weights, trend=signal_trend)
+            
+            # Evaluate on training period only (to avoid data leakage)
+            train_combined = combined.loc[train_start:train_end]
+            train_obs = original_signal_df.loc[train_start:train_end]
+            
+            # Align indices
+            common_idx = train_combined.index.intersection(train_obs.index)
+            if len(common_idx) < 10:
+                continue
+            
+            metrics = calculate_performance_metrics(
+                train_obs.loc[common_idx], 
+                train_combined.loc[common_idx]
+            )
+            
+            tuning_results.append({
+                'freq_threshold': freq_thresh,
+                'train_cc': metrics['cc'],
+                'train_nrmse': metrics['nrmse'],
+                'train_loss': metrics['loss']
+            })
+            
+            # Check if this is the best based on selection criterion
+            if selection_criterion == 'cc':
+                # Select based on highest CC (better generalization)
+                if not np.isnan(metrics['cc']) and metrics['cc'] > best_cc:
+                    best_cc = metrics['cc']
+                    best_loss = metrics['loss']
+                    best_threshold = freq_thresh
+                    best_predictions = component_predictions.copy()
+            else:
+                # Select based on lowest loss
+                if not np.isnan(metrics['loss']) and metrics['loss'] < best_loss:
+                    best_loss = metrics['loss']
+                    best_cc = metrics['cc']
+                    best_threshold = freq_thresh
+                    best_predictions = component_predictions.copy()
+                
+        except Exception as e:
+            print(f"  Warning: freq_threshold={freq_thresh} failed: {e}")
+            continue
+    
+    # Print tuning results
+    print("\n--- Frequency Threshold Tuning Results ---")
+    print(f"{'Threshold':<12} {'Train CC':<12} {'Train NRMSE':<14} {'Train Loss':<12}")
+    print("-" * 50)
+    for result in tuning_results:
+        cc_str = f"{result['train_cc']:.4f}" if not np.isnan(result['train_cc']) else 'N/A'
+        nrmse_str = f"{result['train_nrmse']:.4f}" if not np.isnan(result['train_nrmse']) else 'N/A'
+        loss_str = f"{result['train_loss']:.4f}" if not np.isnan(result['train_loss']) else 'N/A'
+        marker = " <-- BEST" if result['freq_threshold'] == best_threshold else ""
+        print(f"{result['freq_threshold']:<12} {cc_str:<12} {nrmse_str:<14} {loss_str:<12}{marker}")
+    print("-" * 50)
+    print(f"Selection criterion: {selection_criterion.upper()}")
+    print(f"Selected frequency threshold: {best_threshold}")
+    print(f"Best training CC: {best_cc:.4f}, Loss: {best_loss:.4f}")
+    print("=" * 60)
+    
+    return best_threshold, best_predictions, tuning_results
+
+
+# ==============================================================
+# SPADS PIPELINE FOR A SINGLE CSV
+# ==============================================================
+def run_spads_for_file(input_csv_path: Path, wave_nc_path: Path, 
+                       weight_method='correlation_squared',
+                       freq_thresholds=FREQ_THRESHOLDS_TO_TEST,
+                       selection_criterion='cc'):
+    """
+    Runs the full SPADS pipeline with frequency threshold tuning.
+    """
+    # Reset seed at start of each file for reproducibility
+    np.random.seed(RANDOM_SEED)
+    random.seed(RANDOM_SEED)
+    
+    print("\n" + "=" * 80)
+    print(f"RUNNING SPADS FOR FILE: {input_csv_path}")
+    print(f"Weight Method: {weight_method}")
+    print(f"Selection Criterion: {selection_criterion}")
+    print(f"Frequency Thresholds to Test: {freq_thresholds}")
+    print(f"Random Seed: {RANDOM_SEED}")
+    print(f"Parallel Processing: {USE_PARALLEL}")
+    print("=" * 80)
+
+    region_name = input_csv_path.parent.name 
+    BEACH_ID = input_csv_path.stem.split("_")[0] 
+    
+    spads_folder = OUTPUT_DIR / region_name / "SPADS"
+    spads_folder.mkdir(parents=True, exist_ok=True)
+
+    # ==============================================================
+    # LOAD SHORELINE CSV
+    # ==============================================================
+    print(f"Loading shoreline data: {input_csv_path}")
+    raw_df = pd.read_csv(input_csv_path)
+    raw_df[time_col] = pd.to_datetime(raw_df[time_col])
+    
+    if 'Avg_Center_Y' in raw_df.columns:
+        lat_col = 'Avg_Center_Y'
+        lon_col = 'Avg_Center_X'
+    elif 'avg_center_y' in raw_df.columns:
+        lat_col = 'avg_center_y'
+        lon_col = 'avg_center_x'
+    else:
+        raise ValueError("Input CSV must contain center coordinate columns.")
+
+    beach_lat = raw_df[lat_col].iloc[0]
+    beach_lon = raw_df[lon_col].iloc[0]
+    print(f"\n--- BEACH LOCATION ---")
+    print(f"Beach lat={beach_lat:.5f}, lon={beach_lon:.5f}")
+
+    keep_cols = [time_col, signal]
+    if "real_date" in raw_df.columns:
+        keep_cols.append("real_date")
+    raw_df = raw_df[keep_cols].copy()
+
+    # ==============================================================
+    # OPEN NETCDF & DECODE TIME
+    # ==============================================================
+    print(f"\nOpening NetCDF: {wave_nc_path}")
+    ds = xr.open_dataset(wave_nc_path)
+    time_var = ds['time']
+    time_vals = time_var.values
+    ref_date = pd.Timestamp("2000-01-01")
+    decoded_ok = False
+    time_dates = None
+
+    try:
+        units = time_var.attrs.get('units', '')
+        calendar = time_var.attrs.get('calendar', 'standard')
+        if units:
+            decoded = cftime.num2date(time_vals, units=units, calendar=calendar)
+            time_dates = pd.to_datetime(decoded)
+            decoded_ok = True
+    except Exception:
+        pass
+        
+    if not decoded_ok and np.issubdtype(time_vals.dtype, np.datetime64):
+        time_dates = pd.to_datetime(time_vals)
+        decoded_ok = True
+        
+    if time_dates is not None:
+        if time_dates.tz is not None:
+            time_dates = time_dates.tz_localize(None)
+        time_nums = (time_dates.normalize() - ref_date).days.values.astype(np.int64)
+    else:
+        if not decoded_ok:
+            time_nums = (time_vals.astype(float) / 86400e9).astype(int)
+            decoded_ok = True
+        
+    if not decoded_ok:
+        raise ValueError("Could not decode NetCDF time variable.")
+
+    print(f"Decoded NetCDF time → {len(time_nums)} days")
+
+    # ==============================================================
+    # COMMON DATES
+    # ==============================================================
+    shore_dates = raw_df[time_col].dt.normalize()
+    if shore_dates.dt.tz is not None:
+        shore_dates = shore_dates.dt.tz_localize(None)
+
+    shore_day_offsets = (shore_dates - ref_date).dt.days.values.astype(np.int64)
+    common_days = np.intersect1d(shore_day_offsets, time_nums)
+    if len(common_days) == 0:
+        raise ValueError("No overlapping dates between shoreline & wave dataset!")
+    common_dates = ref_date + pd.to_timedelta(common_days, unit='D')
+    common_dates = common_dates.normalize()
+    
+    print(f"\nCommon dates found: {len(common_dates)} days")
+    print(f"Range: {common_dates.min()} → {common_dates.max()}")
+
+    # ==============================================================
+    # FIND NEAREST GRID POINT (HAVERSINE)
+    # ==============================================================
+    print("\n--- FINDING NEAREST GRID POINT ---")
+    lat2d = ds['latitude'].values
+    lon2d = ds['longitude'].values
+    lon_grid, lat_grid = np.meshgrid(lon2d, lat2d)
+    grid_lats = lat_grid.ravel()
+    grid_lons = lon_grid.ravel()
+
+    time_mask = np.isin(time_nums, common_days)
+    valid_mask = np.zeros(len(grid_lats), dtype=bool)
+    for var in WAVE_VARS:
+        var_data = ds[var].values
+        common_slice = var_data[time_mask, :, :]
+        common_flat = common_slice.reshape(common_slice.shape[0], -1)
+        valid_mask |= np.isfinite(common_flat).any(axis=0)
+    valid_lats = grid_lats[valid_mask]
+    valid_lons = grid_lons[valid_mask]
+
+    def haversine_np(lat1, lon1, lat2, lon2):
+        R = 6371.0
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+        return 2 * R * np.arcsin(np.sqrt(a))
+
+    distances = haversine_np(beach_lat, beach_lon, valid_lats, valid_lons)
+    min_idx = np.argmin(distances)
+    nearest_lat_valid = valid_lats[min_idx]
+    nearest_lon_valid = valid_lons[min_idx]
+    nearest_dist_km = distances[min_idx]
+    flat_idx = np.where((lat_grid.ravel() == nearest_lat_valid) &
+                        (lon_grid.ravel() == nearest_lon_valid))[0][0]
+    i, j = np.unravel_index(flat_idx, lat_grid.shape)
+    print(f"Nearest: lat={nearest_lat_valid:.5f}, lon={nearest_lon_valid:.5f}, dist={nearest_dist_km:.3f}km")
+
+    # ==============================================================
+    # EXTRACT WAVE DATA AND APPLY 15-DAY EWMA
+    # ==============================================================
+    print("\n--- EXTRACTING AND SMOOTHING WAVE DATA (15-DAY EWMA) ---")
+    wave_arrays = {}
+    for var in WAVE_VARS:
+        da = ds[var].isel(latitude=i, longitude=j)
+        # 1. Extract the daily values
+        daily_values = da.values[time_mask]
+        # 2. Create a temporary Series indexed by common_dates for EWMA calculation
+        temp_series = pd.Series(daily_values, index=common_dates)
+        
+        # 3. Apply EWMA with span=15 (equivalent to window=15 for EWM)
+        # min_periods=1 ensures that the average starts immediately
+        averaged_values = temp_series.ewm(span=15, min_periods=1).mean()
+        
+        # 4. Store the averaged array for the SPADS pipeline
+        wave_arrays[var] = averaged_values.values
+        print(f"  Applied 15-day EWMA to {var}")
+
+    # ==============================================================
+    # ASSEMBLE ALIGNED DATAFRAME
+    # ==============================================================
+    shoreline_data = raw_df.set_index(time_col).sort_index()
+    if shoreline_data.index.tz is not None:
+        shoreline_data.index = shoreline_data.index.tz_localize(None)
+
+    aligned = pd.DataFrame(index=common_dates)
+    aligned[signal] = shoreline_data.loc[common_dates.normalize(), signal].values 
+    
+    if aligned[signal].isna().all():
+        raise ValueError(f"Shoreline signal is entirely NaN.")
+
+    for var in WAVE_VARS:
+        aligned[var] = wave_arrays[var]
+        
+    if "real_date" in shoreline_data.columns:
+        aligned["real_date"] = shoreline_data.loc[common_dates.normalize(), "real_date"].values
+
+    dfs = {}
+    for col in aligned.columns:
+        if col == "real_date":
+            continue
+        ser = aligned[col].copy()
+        ser.index = pd.to_datetime(ser.index)
+        dfs[col] = ser
+    original_signal_df = dfs[signal].copy()
+
+    # ==============================================================
+    # SPADS PIPELINE - DECOMPOSITION (done once, reused for tuning)
+    # ==============================================================
+    noises = NOISE_LEVELS
+    noise_threshold = 0.95
+    exclude_trend = True
+    normalize_drivers = False
+
+    train_start = dfs[signal].index.min()
+    train_end = dfs[signal].index.max()
+    driver_end = max(df.index.max() for df in dfs.values())
+
+    if exclude_trend:
+        d_train = dfs[signal].loc[train_start:train_end]
+        signal_trend = detect_trend(d_train)
+        dfs[signal] = dfs[signal] - gen_trend(dfs[signal], signal_trend)
+    else:
+        signal_trend = TrendModel()
+
+    detrended_signal = dfs[signal].copy()
+
+    imf_dir = spads_folder / "imfs"
+    imf_dir.mkdir(exist_ok=True)
+
+    # Decompose IMFs (this is the expensive part, done once)
+    print(f"\nDecomposing IMFs (num_trials={NUM_TRIALS}, parallel={USE_PARALLEL})...")
+    for col in tqdm(dfs, desc="Decomposing IMFs"):
+        for noise in noises:
+            filename = imf_filename(imf_dir, col, noise)
+            if filename.exists():
+                continue
+            if col == signal:
+                df_dec = dfs[col].loc[train_start:train_end]
+            else:
+                df_dec = dfs[col].loc[train_start:driver_end]
+            
+            # Reset seed before each decomposition for reproducibility
+            np.random.seed(RANDOM_SEED)
+            random.seed(RANDOM_SEED)
+            
+            imf_df = steps.decompose(df_dec, noise=noise, num_trials=NUM_TRIALS,
+                                     progress=False, parallel=USE_PARALLEL)
+            imf_df.to_csv(filename)
+
+    imfs = load_imfs(imf_dir)
+
+    if noise_threshold is not None:
+        for label, imf_df in imfs.items():
+            try:
+                sig = steps.whitenoise_check(imf_df.to_numpy().T, alpha=noise_threshold)
+                if sig is not None:
+                    rejects = [k for k, v in sig.items() if v == 0]
+                    if rejects:
+                        imfs[label] = imf_df.drop(columns=rejects)
+            except Exception:
+                pass
+
+    imfs_by_noise = {}
+    for (label, noise), imf_df in imfs.items():
+        imfs_by_noise.setdefault(noise, {})[label] = imf_df
+
+    # ==============================================================
+    # FREQUENCY THRESHOLD TUNING
+    # ==============================================================
+    best_freq_threshold, best_component_predictions, tuning_results = tune_frequency_threshold(
+        imfs_by_noise=imfs_by_noise,
+        dfs=dfs,
+        signal=signal,
+        original_signal_df=original_signal_df,
+        signal_trend=signal_trend,
+        train_start=train_start,
+        train_end=train_end,
+        driver_end=driver_end,
+        noises=noises,
+        freq_thresholds=freq_thresholds,
+        weight_method=weight_method,
+        exclude_trend=exclude_trend,
+        normalize_drivers=normalize_drivers,
+        selection_criterion=selection_criterion
+    )
+    
+    # Save tuning results
+    tuning_df = pd.DataFrame(tuning_results)
+    tuning_df.to_csv(spads_folder / f"{BEACH_ID}_freq_tuning.csv", index=False)
+
+    # ==============================================================
+    # FINAL PREDICTIONS WITH BEST THRESHOLD
+    # ==============================================================
+    if best_component_predictions is None:
+        print("Warning: Tuning failed, using default threshold 0.25")
+        best_freq_threshold = 0.25
+        
+        best_component_predictions = {}
+        for noise in noises:
+            full = imfs_by_noise[noise]
+            imfs_train = {lab: df.loc[train_start:train_end] for lab, df in full.items()}
+            nearest_freqs = steps.match_frequencies(imfs_train, signal, best_freq_threshold, exclude_trend)
+            coefficients = steps.fit(imfs_train, nearest_freqs, signal, model="mreg2", 
+                                     fit_intercept=True, normalize=normalize_drivers)
+            preds = steps.predict(full, nearest_freqs, signal, coefficients, 
+                                  train_start, driver_end, exclude_trend=exclude_trend)
+            best_component_predictions[noise] = preds
+
+    # Calculate final weights
+    print("\n--- Final Weighted Ensemble (with tuned threshold) ---")
+    weights, noise_metrics = calculate_noise_weights(
+        best_component_predictions, 
+        detrended_signal,
+        train_start, 
+        train_end,
+        weight_method=weight_method
+    )
+    
+    log_weights(BEACH_ID, weights, noise_metrics, spads_folder)
+    
+    # Weighted combination
+    total_weighted = weighted_combine_predictions(
+        best_component_predictions, 
+        weights, 
+        trend=signal_trend
+    )
+    
+    # Simple average with DEFAULT threshold (0.25) for comparison
+    default_component_predictions = {}
+    for noise in noises:
+        full = imfs_by_noise[noise]
+        imfs_train = {lab: df.loc[train_start:train_end] for lab, df in full.items()}
+        nearest_freqs = steps.match_frequencies(imfs_train, signal, 0.25, exclude_trend)
+        coefficients = steps.fit(imfs_train, nearest_freqs, signal, model="mreg2", 
+                                 fit_intercept=True, normalize=normalize_drivers)
+        preds = steps.predict(full, nearest_freqs, signal, coefficients, 
+                              train_start, driver_end, exclude_trend=exclude_trend)
+        default_component_predictions[noise] = preds
+    
+    total_default = steps.combine_predictions(default_component_predictions, trend=signal_trend)
+    total_default_series = get_prediction_series(total_default)
+    
+    # ==============================================================
+    # SAVE RESULTS
+    # ==============================================================
+    final_df = pd.DataFrame(index=total_weighted.index)
+    final_df["prediction"] = total_weighted.values
+    final_df["prediction_default"] = total_default_series.reindex(total_weighted.index).values
+    final_df["observation"] = original_signal_df.reindex(total_weighted.index).values
+    final_df["best_freq_threshold"] = best_freq_threshold
+    
+    if "real_date" in aligned.columns:
+        real_date_series = aligned["real_date"]
+        final_df["real_date"] = real_date_series.reindex(total_weighted.index).values
+
+    final_output = spads_folder / f"{BEACH_ID}_reconstructed_total.csv"
+    final_df.to_csv(final_output, index_label="date")
+
+    # ==============================================================
+    # PLOTTING + CLEANUP + METRICS
+    # ==============================================================
+    def plot_custom_results(beach_id: str, spads_folder: Path, best_threshold: float):
+        plot_path = spads_folder / f"{beach_id}_reconstructed_total.csv"
+        output_plot = spads_folder / f"{beach_id}_time_series.png"
+        output_plot_comparison = spads_folder / f"{beach_id}_tuned_vs_default.png"
+        
+        if not plot_path.exists():
+            print(f"Error: Final CSV not found at {plot_path}")
+            return
+            
+        data = pd.read_csv(plot_path, index_col='date', parse_dates=True)
+        
+        data = data.rename(columns={
+            'observation': 'Observed', 
+            'prediction': 'Predicted_Tuned',
+            'prediction_default': 'Predicted_Default'
+        })
+        
+        if "real_date" not in data.columns:
+            data["real_date"] = pd.NaT
+        
+        filtered = data[data['Observed'].notna() & data['real_date'].notna()].copy()
+        
+        if filtered.empty:
+            filtered = data[data['Observed'].notna()].copy()
+            if filtered.empty:
+                print("\n--- WARNING: No valid data points for plotting ---")
+                return
+            
+        train_data = filtered[filtered.index <= pd.Timestamp('2020-12-31')]
+        test_data = filtered[filtered.index >= pd.Timestamp('2021-01-01')]
+
+        def safe_metrics(o, p):
+            result = calculate_performance_metrics(o, p)
+            return (
+                round(result['cc'], 3) if not np.isnan(result['cc']) else 0.0,
+                round(result['rmse'], 3) if not np.isnan(result['rmse']) else 0.0,
+                round(result['nrmse'], 3) if not np.isnan(result['nrmse']) else 0.0,
+                round(result['norm_std'], 3) if not np.isnan(result['norm_std']) else 0.0,
+                round(result['loss'], 3) if not np.isnan(result['loss']) else 0.0
+            )
+
+        m_tr_t = safe_metrics(train_data['Observed'], train_data['Predicted_Tuned'])
+        m_te_t = safe_metrics(test_data['Observed'], test_data['Predicted_Tuned'])
+        m_tr_d = safe_metrics(train_data['Observed'], train_data['Predicted_Default'])
+        m_te_d = safe_metrics(test_data['Observed'], test_data['Predicted_Default'])
+        
+        (cc_tr_t, _, nrm_tr_t, nstd_tr_t, loss_tr_t) = m_tr_t
+        (cc_te_t, _, nrm_te_t, nstd_te_t, loss_te_t) = m_te_t
+        (cc_tr_d, _, nrm_tr_d, nstd_tr_d, loss_tr_d) = m_tr_d
+        (cc_te_d, _, nrm_te_d, nstd_te_d, loss_te_d) = m_te_d
+
+        # Main plot
+        plt.figure(figsize=(14, 6))
+        plt.plot(filtered.index, filtered['Observed'], label='Observation', color='blue', lw=1.2)
+        plt.plot(filtered.index, filtered['Predicted_Tuned'], 
+                 label=f'SPADS Tuned (thresh={best_threshold})', color='red', lw=1.6)
+
+        test_start_date = pd.Timestamp('2021-01-01')
+        test_end_date = pd.Timestamp('2025-12-31')
+        plt.axvspan(test_start_date, test_end_date, color='gray', alpha=0.3, label='Prediction Period')
+        
+        txt = (f"TUNED (freq_thresh={best_threshold}):\n"
+               f"Train -> CC={cc_tr_t:.3f} NRMSE={nrm_tr_t:.3f} Loss={loss_tr_t:.3f}\n"
+               f"Test  -> CC={cc_te_t:.3f} NRMSE={nrm_te_t:.3f} Loss={loss_te_t:.3f}")
+               
+        plt.text(0.99, 0.01, txt, transform=plt.gca().transAxes,
+                 ha='right', va='bottom', fontsize=9.5,
+                 bbox=dict(facecolor='white', alpha=0.9, edgecolor='black'))
+                 
+        plt.xlabel('Date')
+        plt.ylabel('Shoreline Position (m)')
+        plt.title(f'{beach_id} - SPADS with Tuned Frequency Threshold')
+        ax = plt.gca()
+        ax.xaxis.set_major_locator(mdates.YearLocator(3))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        plt.gcf().autofmt_xdate()
+        plt.legend(loc='lower left')
+        plt.grid(True, ls='--', alpha=0.6)
+        plt.tight_layout()
+        plt.savefig(output_plot, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Main plot saved to {output_plot}")
+        
+        # Comparison plot
+        fig, axes = plt.subplots(2, 1, figsize=(14, 10), sharex=True)
+        
+        axes[0].plot(filtered.index, filtered['Observed'], label='Observation', color='blue', lw=1.2)
+        axes[0].plot(filtered.index, filtered['Predicted_Tuned'], 
+                     label=f'Tuned (thresh={best_threshold})', color='red', lw=1.6)
+        axes[0].axvspan(test_start_date, test_end_date, color='gray', alpha=0.3)
+        axes[0].set_ylabel('Shoreline Position (m)')
+        axes[0].set_title(f'{beach_id} - Tuned (Test CC={cc_te_t:.3f}, Loss={loss_te_t:.3f})')
+        axes[0].legend(loc='lower left')
+        axes[0].grid(True, ls='--', alpha=0.6)
+        
+        axes[1].plot(filtered.index, filtered['Observed'], label='Observation', color='blue', lw=1.2)
+        axes[1].plot(filtered.index, filtered['Predicted_Default'], 
+                     label='Default (thresh=0.25)', color='green', lw=1.6)
+        axes[1].axvspan(test_start_date, test_end_date, color='gray', alpha=0.3)
+        axes[1].set_xlabel('Date')
+        axes[1].set_ylabel('Shoreline Position (m)')
+        axes[1].set_title(f'{beach_id} - Default (Test CC={cc_te_d:.3f}, Loss={loss_te_d:.3f})')
+        axes[1].legend(loc='lower left')
+        axes[1].grid(True, ls='--', alpha=0.6)
+        
+        axes[1].xaxis.set_major_locator(mdates.YearLocator(3))
+        axes[1].xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+        
+        plt.tight_layout()
+        plt.savefig(output_plot_comparison, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"Comparison plot saved to {output_plot_comparison}")
+        
+        # Print improvement
+        print("\n--- TUNED vs DEFAULT COMPARISON ---")
+        cc_imp = cc_te_t - cc_te_d
+        loss_imp = loss_te_d - loss_te_t
+        print(f"Best threshold: {best_threshold} (default: 0.25)")
+        print(f"Test CC:   Tuned={cc_te_t:.4f}, Default={cc_te_d:.4f}, Improvement={cc_imp:+.4f}")
+        print(f"Test Loss: Tuned={loss_te_t:.4f}, Default={loss_te_d:.4f}, Improvement={loss_imp:+.4f}")
+
+    def cleanup_intermediate_files(spads_folder: Path, beach_id: str, noises: list):
+        print("\n--- Cleanup ---")
+        imf_dir_local = spads_folder / "imfs" 
+        if imf_dir_local.exists():
+            shutil.rmtree(imf_dir_local)
+            print(f"Deleted: {imf_dir_local}")
+
+    def compute_and_store_metrics(beach_id: str, spads_folder: Path, region: str, best_threshold: float):
+        csv_path = spads_folder / f"{beach_id}_reconstructed_total.csv"
+        if not csv_path.exists():
+            return
+        
+        data = pd.read_csv(csv_path, index_col='date', parse_dates=True)
+        data = data.rename(columns={
+            'observation': 'Observed', 
+            'prediction': 'Predicted_Tuned',
+            'prediction_default': 'Predicted_Default'
+        })
+        
+        if "real_date" not in data.columns:
+            data["real_date"] = pd.NaT
+
+        filtered = data[data['Observed'].notna()].copy()
+        if filtered.empty:
+            return
+
+        train_data = filtered[filtered.index <= pd.Timestamp('2020-12-31')]
+        test_data = filtered[filtered.index >= pd.Timestamp('2021-01-01')]
+
+        def get_metrics(o, p):
+            result = calculate_performance_metrics(o, p)
+            return (
+                round(result['cc'], 3) if not np.isnan(result['cc']) else 0.0,
+                round(result['nrmse'], 3) if not np.isnan(result['nrmse']) else 0.0,
+                round(result['loss'], 3) if not np.isnan(result['loss']) else 0.0
+            )
+
+        cc_tr_t, nr_tr_t, loss_tr_t = get_metrics(train_data['Observed'], train_data['Predicted_Tuned'])
+        cc_te_t, nr_te_t, loss_te_t = get_metrics(test_data['Observed'], test_data['Predicted_Tuned'])
+        cc_tr_d, nr_tr_d, loss_tr_d = get_metrics(train_data['Observed'], train_data['Predicted_Default'])
+        cc_te_d, nr_te_d, loss_te_d = get_metrics(test_data['Observed'], test_data['Predicted_Default'])
+
+        ALL_METRICS.append({
+            "region": region,
+            "beach_id": beach_id,
+            "best_freq_threshold": best_threshold,
+            "tuned_train_cc": cc_tr_t,
+            "tuned_train_nrmse": nr_tr_t,
+            "tuned_train_loss": loss_tr_t,
+            "tuned_test_cc": cc_te_t,
+            "tuned_test_nrmse": nr_te_t,
+            "tuned_test_loss": loss_te_t,
+            "default_train_cc": cc_tr_d,
+            "default_train_nrmse": nr_tr_d,
+            "default_train_loss": loss_tr_d,
+            "default_test_cc": cc_te_d,
+            "default_test_nrmse": nr_te_d,
+            "default_test_loss": loss_te_d,
+            "cc_improvement": round(cc_te_t - cc_te_d, 4),
+            "loss_improvement": round(loss_te_d - loss_te_t, 4)
+        })
+
+    print("\n=== ANALYSIS COMPLETE ===")
+    plot_custom_results(BEACH_ID, spads_folder, best_freq_threshold)
+    cleanup_intermediate_files(spads_folder, BEACH_ID, noises)
+    compute_and_store_metrics(BEACH_ID, spads_folder, region_name, best_freq_threshold)
+    print(f"\n=== COMPLETE FOR BEACH {BEACH_ID} ===\n")
+
+
+# ==============================================================
+# MAIN
+# ==============================================================
+if __name__ == "__main__":
+    WEIGHT_METHOD = 'correlation_squared'
+    
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 80)
+    print("SPADS WITH FREQUENCY THRESHOLD TUNING + WEIGHTED ENSEMBLE")
+    print("=" * 80)
+    print(f"Parent directory: {PARENT_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print(f"Weight method: {WEIGHT_METHOD}")
+    print(f"Selection criterion: {SELECTION_CRITERION}")
+    print(f"Frequency thresholds to test: {FREQ_THRESHOLDS_TO_TEST}")
+    print(f"Noise levels: {NOISE_LEVELS}")
+    print(f"Num trials: {NUM_TRIALS}")
+    print(f"Parallel processing: {USE_PARALLEL}")
+    print(f"Random seed: {RANDOM_SEED}")
+    print(f"Wave NetCDF: {WAVE_NC_PATH}")
+    print("=" * 80)
+    
+    if not WAVE_NC_PATH.exists():
+        raise FileNotFoundError(f"Wave NetCDF not found: {WAVE_NC_PATH}")
+
+    for region in REGION_DIRS:
+        region_path = PARENT_DIR / region
+        print("\n" + "#" * 80)
+        print(f"PROCESSING REGION: {region_path}")
+        print("#" * 80)
+        if not region_path.exists():
+            print(f"Region folder does not exist, skipping: {region_path}")
+            continue
+
+        shoreline_files = sorted(region_path.glob("*_shoreline_final.csv"))
+        if not shoreline_files:
+            shoreline_files = sorted(region_path.glob("*_shoreline_smoothed_final.csv"))
+            if not shoreline_files:
+                print("No shoreline files found.")
+                continue
+
+        for csv_path in shoreline_files:
+            try:
+                run_spads_for_file(csv_path, WAVE_NC_PATH, weight_method=WEIGHT_METHOD,
+                                   freq_thresholds=FREQ_THRESHOLDS_TO_TEST,
+                                   selection_criterion=SELECTION_CRITERION)
+            except Exception as e:
+                import traceback
+                print(f"\nERROR processing {csv_path}: {e}")
+                traceback.print_exc()
+                print()
+
+    if ALL_METRICS:
+        metrics_df = pd.DataFrame(ALL_METRICS)
+        summary_path = OUTPUT_DIR / "SPADS_metrics_summary.csv"
+        metrics_df.to_csv(summary_path, index=False)
+        
+        print("\n" + "=" * 80)
+        print("OVERALL RESULTS SUMMARY")
+        print("=" * 80)
+        
+        avg_cc_imp = metrics_df['cc_improvement'].mean()
+        avg_loss_imp = metrics_df['loss_improvement'].mean()
+        improved_cc = (metrics_df['cc_improvement'] > 0).sum()
+        improved_loss = (metrics_df['loss_improvement'] > 0).sum()
+        total = len(metrics_df)
+        
+        # Frequency threshold distribution
+        thresh_counts = metrics_df['best_freq_threshold'].value_counts().sort_index()
+        
+        print(f"\nTuned vs Default (thresh=0.25):")
+        print(f"  Avg CC improvement:   {avg_cc_imp:+.4f}")
+        print(f"  Avg Loss improvement: {avg_loss_imp:+.4f}")
+        print(f"\n  Beaches with better CC:   {improved_cc}/{total} ({100*improved_cc/total:.1f}%)")
+        print(f"  Beaches with better Loss: {improved_loss}/{total} ({100*improved_loss/total:.1f}%)")
+        
+        print(f"\nBest frequency threshold distribution:")
+        for thresh, count in thresh_counts.items():
+            print(f"  {thresh}: {count} beaches ({100*count/total:.1f}%)")
+        
+        print(f"\nSummary saved to: {summary_path}")
+        print("=" * 80)
+    else:
+        print("\nNo metrics collected – check for errors above.")
