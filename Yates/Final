@@ -1,0 +1,604 @@
+#Final for now
+import numpy as np
+import pandas as pd
+import xarray as xr
+import cftime
+import warnings
+import logging
+import math
+from pathlib import Path
+from tqdm import tqdm
+from scipy.spatial import cKDTree
+from scipy.optimize import minimize, differential_evolution
+from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import LinearRegression
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+# Suppress minor warnings for clean output
+warnings.filterwarnings('ignore', category=FutureWarning)
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+warnings.filterwarnings('ignore', message="Optimization failed to converge")
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- GLOBAL CONFIGURATION & DATA STRUCTURES ---
+GLOBAL_TREE = None
+GLOBAL_GRID_INDICES = None
+WAVE_VAR = 'hs' # Significant Wave Height (raw)
+R_EARTH = 6371.0 
+ALL_METRICS = [] 
+EWMA_SPAN = 15 # Exponential Moving Average span
+
+# ==============================================================
+# 1. Y09 CORE FUNCTIONS (MODEL & METRICS)
+# ==============================================================
+
+class EquilibriumShorelineModel:
+    """Y09 Equilibrium Shoreline Model Class."""
+    def __init__(self, a, b, C_plus, C_minus):
+        if C_plus < 0 or C_minus < 0:
+            raise ValueError("C_plus and C_minus must be non-negative.")
+        self.a = a
+        self.b = b
+        self.C_plus = C_plus
+        self.C_minus = C_minus
+
+    def equilibrium_wave_energy(self, S):
+        """Calculate equilibrium wave energy."""
+        return self.a * S + self.b
+
+    def shoreline_change_rate(self, S, E):
+        """Calculate shoreline change rate based on wave energy (using provided sign convention)."""
+        E_eq = self.equilibrium_wave_energy(S)
+        delta_E = np.clip(E - E_eq, -1e6, 1e6)
+        # E is the smoothed wave energy (Hs^2)
+        return (self.C_plus if delta_E < 0 else -self.C_minus) * np.sqrt(np.abs(E)) * np.abs(delta_E)
+
+    def simulate(self, initial_S, E_series, dt=1):
+        """Simulate shoreline positions (fixed to return N points)."""
+        S_series = np.zeros(len(E_series) + 1)
+        S_series[0] = initial_S
+        for i, E in enumerate(E_series):
+            E_val = max(0, E) 
+            dS_dt = self.shoreline_change_rate(S_series[i], E_val)
+            S_series[i + 1] = S_series[i] + dS_dt * dt
+            
+        return np.nan_to_num(S_series[1:])
+
+def mse_loss_function(params, initial_S_detrended, E_obs, trend, S_obs):
+    """Calculate mean squared error loss."""
+    try:
+        a, b, C_plus, C_minus = params
+        if C_plus < 0 or C_minus < 0: return np.inf
+        
+        model = EquilibriumShorelineModel(a, b, C_plus, C_minus)
+        S_sim_detrended = model.simulate(initial_S_detrended, E_obs)
+        
+        min_len = min(len(S_sim_detrended), len(S_obs))
+        S_sim = S_sim_detrended[:min_len] + trend[:min_len]
+        
+        return mean_squared_error(S_obs[:min_len], S_sim)
+    except Exception:
+        return np.inf
+
+def optimize_parameters(initial_params, param_bounds, initial_S_detrended, E_obs, trend, S_obs):
+    """
+    Optimize model parameters using global and local optimization.
+    MAXITER reduced for efficiency in batch processing.
+    """
+    try:
+        # 1. Global search (Differential Evolution)
+        result_global = differential_evolution(
+            mse_loss_function, bounds=param_bounds, args=(initial_S_detrended, E_obs, trend, S_obs),
+            maxiter=500, popsize=20, tol=1e-6, seed=42, disp=False
+        )
+        
+        # 2. Local refinement (L-BFGS-B)
+        result_local = minimize(
+            mse_loss_function, result_global.x, args=(initial_S_detrended, E_obs, trend, S_obs),
+            bounds=param_bounds, method='L-BFGS-B', 
+            options={'disp': False, 'maxiter': 2000, 'ftol': 1e-8, 'maxls': 100}
+        )
+        
+        if not result_local.success:
+             # Fallback to the global result if local refinement fails
+             return result_global 
+        
+        return result_local
+    except Exception as e:
+        logging.error(f"Optimization failed: {e}")
+        raise
+
+def calculate_metrics(S_obs, S_sim):
+    """Calculate evaluation metrics (returns dict and formatted tuple)."""
+    min_len = min(len(S_obs), len(S_sim))
+    S_obs = S_obs[:min_len]
+    S_sim = S_sim[:min_len]
+    
+    if min_len < 2:
+        zero_metrics = {'cc': np.nan, 'rmse': np.nan, 'norm_rmse': np.nan, 'norm_std': np.nan, 'loss': np.nan}
+        return zero_metrics, (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    cc = np.corrcoef(S_obs, S_sim)[0, 1]
+    rmse = np.sqrt(mean_squared_error(S_obs, S_sim))
+    std_obs = np.std(S_obs)
+    std_pred = np.std(S_sim)
+    norm_rmse = rmse / std_obs if std_obs != 0 else np.inf
+    norm_std = std_pred / std_obs if std_obs != 0 else np.inf
+    
+    loss = np.sqrt((0 - norm_rmse)**2 + (1 - cc)**2 + (1 - norm_std)**2)
+
+    results_dict = {'cc': cc, 'rmse': rmse, 'norm_rmse': norm_rmse, 'norm_std': norm_std, 'loss': loss}
+    
+    results_tuple = (
+        round(cc, 4), round(rmse, 4), round(norm_rmse, 4), 
+        round(norm_std, 4), round(loss, 4)
+    )
+    return results_dict, results_tuple
+
+# ==============================================================
+# 2. DATA HANDLING (Ocean-Filtered Wave Extraction with EWMA on Energy)
+# ==============================================================
+
+def initialize_global_kd_tree(wave_nc_path: Path):
+    """Initializes the global KD-Tree based on valid ocean points."""
+    global GLOBAL_TREE, GLOBAL_GRID_INDICES
+    logging.info("\n--- Initializing Global KD-Tree ---")
+    
+    try:
+        with xr.open_dataset(wave_nc_path) as ds:
+            lat2d = ds['latitude'].values
+            lon2d = ds['longitude'].values
+            lon_grid, lat_grid = np.meshgrid(lon2d, lat2d)
+            
+            if WAVE_VAR not in ds.variables:
+                 raise ValueError(f"Wave variable '{WAVE_VAR}' not found in NetCDF.")
+                 
+            wave_data_flat = ds[WAVE_VAR].isel(time=0).values.ravel()
+            valid_mask = np.isfinite(wave_data_flat)
+            valid_lats = lat_grid.ravel()[valid_mask]
+            valid_lons = lon_grid.ravel()[valid_mask]
+            
+            flat_indices_valid = np.where(valid_mask)[0]
+            i_indices, j_indices = np.unravel_index(flat_indices_valid, lat_grid.shape)
+            
+            coords = np.vstack([valid_lats, valid_lons]).T
+            GLOBAL_TREE = cKDTree(coords)
+            GLOBAL_GRID_INDICES = (i_indices, j_indices, valid_lats, valid_lons)
+            
+            logging.info(f"KD-Tree built from {len(valid_lats)} valid ocean points.")
+    except Exception as e:
+        logging.error(f"Failed to initialize KD-Tree: {e}")
+        raise
+
+def load_and_merge_data(input_csv_path: Path, wave_nc_path: Path):
+    """
+    Loads shoreline data, finds the nearest ocean grid point, extracts raw Hs,
+    CALCULATES RAW WAVE ENERGY (Hs^2), APPLIES EWMA TO ENERGY, and merges/aligns data.
+    """
+    global GLOBAL_TREE, GLOBAL_GRID_INDICES
+    
+    time_col = "date"
+    shore_col = "shoreline_smoothed"
+    
+    raw_input_df = pd.read_csv(input_csv_path)
+    
+    # 1. Identify Columns and Prepare Primary Index
+    lat_col = next((c for c in raw_input_df.columns if 'center_y' in c.lower() or 'lat' in c.lower()), None)
+    lon_col = next((c for c in raw_input_df.columns if 'center_x' in c.lower() or 'lon' in c.lower()), None)
+    shore_col = 'shore' if 'shore' in raw_input_df.columns else shore_col 
+
+    if not (lat_col and lon_col): raise ValueError("Input CSV must contain center coordinate columns.")
+    if not (shore_col in raw_input_df.columns): raise ValueError("Input CSV must contain a shoreline column ('shoreline_smoothed' or 'shore').")
+    
+    beach_lat = raw_input_df[lat_col].iloc[0]
+    beach_lon = raw_input_df[lon_col].iloc[0]
+    
+    # Create primary Datetime Index from the time_col
+    dates_series = pd.to_datetime(raw_input_df[time_col])
+    if dates_series.dt.tz is not None:
+        dates_series = dates_series.dt.tz_localize(None)
+    datetime_index = dates_series.dt.normalize()
+
+    # 2. Prepare Shoreline Data Frame
+    shoreline_data = raw_input_df.rename(columns={shore_col: 'shore'}).set_index(datetime_index)
+    
+    # Preserve 'real_date' column as string for traceability
+    real_date_series = None
+    if 'real_date' in raw_input_df.columns:
+        real_dates_raw = raw_input_df['real_date'].values
+        # Store as string object to avoid future date-handling errors
+        real_date_series = pd.Series(real_dates_raw, index=datetime_index, name='real_date_str').astype(str)
+    
+    # 3. Spatial Query and Index Mapping
+    if GLOBAL_TREE is None: raise RuntimeError("Global KD-Tree not initialized.")
+        
+    distance, nearest_index_ptr = GLOBAL_TREE.query([beach_lat, beach_lon], k=1)
+    i_indices, j_indices, _, _ = GLOBAL_GRID_INDICES
+    lat_i = i_indices[nearest_index_ptr]
+    lon_j = j_indices[nearest_index_ptr]
+    
+    # 4. Extract Raw Hs Data and Calculate Raw Wave Energy
+    raw_energy_series = None
+    try:
+        with xr.open_dataset(wave_nc_path) as ds:
+            # Time Sync
+            netcdf_days = ds['time'].to_series().index
+            if not isinstance(netcdf_days, pd.DatetimeIndex):
+                time_var = ds['time']
+                decoded = cftime.num2date(time_var.values, units=time_var.attrs.get('units', ''), calendar=time_var.attrs.get('calendar', 'standard'))
+                netcdf_days = pd.to_datetime(decoded)
+            netcdf_days = netcdf_days.normalize()
+
+            # Extract RAW Hs
+            da = ds[WAVE_VAR].isel(latitude=lat_i, longitude=lon_j)
+            raw_hs_series = pd.Series(da.values, index=netcdf_days) 
+            
+            # Calculate RAW Wave Energy (Hs^2)
+            raw_energy_series = raw_hs_series ** 2
+            
+    except Exception as e:
+        raise Exception(f"Error during wave extraction: {e}")
+
+    # APPLY 15-DAY EWMA TO WAVE ENERGY
+    smoothed_energy_series = raw_energy_series.ewm(span=EWMA_SPAN, min_periods=1).mean()
+    
+    # 5. Combine, Resample, and Clean
+    combined_data = pd.DataFrame(index=shoreline_data.index.union(smoothed_energy_series.index).unique()).sort_index()
+    combined_data['shore'] = shoreline_data['shore']
+    
+    # Store smoothed energy directly in the 'wave_energy' column
+    combined_data['wave_energy'] = smoothed_energy_series 
+    
+    # Add 'real_date' string series
+    if real_date_series is not None:
+        combined_data = combined_data.join(real_date_series, how='left')
+
+    # Final resampling and cleaning
+    combined_data = combined_data.resample('D').interpolate(method='linear', limit_direction='forward')
+    
+    # Drop rows based on core modeling variables (shore and wave_energy)
+    combined_data.dropna(subset=['shore', 'wave_energy'], how='any', inplace=True)
+    
+    MIN_DATA_POINTS = 30
+    if len(combined_data) < MIN_DATA_POINTS:
+         raise ValueError(f"Insufficient overlapping data ({len(combined_data)} days).")
+    
+    logging.info(f"Data prepared from {combined_data.index.min().date()} to {combined_data.index.max().date()} ({len(combined_data)} days). Wave Energy smoothed with EWMA={EWMA_SPAN}.")
+    
+    return combined_data
+
+def split_and_prepare_data(data, split_date='2020-12-31'):
+    """
+    Split data and calculate the Unified Wave-Based Trend component.
+    """
+    
+    train_data = data.loc[:pd.to_datetime(split_date)].copy()
+    start_predict_date = pd.to_datetime(split_date) + pd.Timedelta(days=1)
+    predict_data = data.loc[start_predict_date:].copy()
+
+    if train_data.empty: raise ValueError("Training period is empty after splitting.")
+
+    S_obs = train_data['shore'].values
+    
+    # --- LOGIC FOR UNIFIED WAVE-BASED TREND ---
+    
+    X_train_E = train_data[['wave_energy']].values
+    y_train_S = train_data['shore'].values
+    
+    # 1. Fit the Linear Trend Model: Shoreline position explained by Wave Energy
+    trend_model = LinearRegression()
+    
+    if len(X_train_E) < 2:
+        # Handle insufficient data by using zero trend and detrended S
+        trend = np.zeros(len(S_obs))
+        S_obs_detrended = S_obs
+        trend_model = None # Flag model as failed/unfitted
+    else:
+        trend_model.fit(X_train_E, y_train_S)
+        
+        # 2. Calculate the Trend component (Prediction on Training Data)
+        trend = trend_model.predict(X_train_E).flatten()
+        
+        # 3. Detrend the Shoreline (Subtract the wave-based trend)
+        S_obs_detrended = y_train_S - trend
+
+    # NOTE: trend_model (LinearRegression object) is returned as "trend_coeffs"
+    return train_data, predict_data, S_obs, S_obs_detrended, trend, trend_model
+
+# ==============================================================
+# 3. PLOTTING FUNCTION (New Style) - With Real-Date Scatter Plot (SPADS style)
+# ==============================================================
+
+def plot_results_new_style(beach_id, train_data, predict_data, S_obs, S_sim_train, S_predict, y_test, metrics, output_folder):
+    """
+    Plots Observed, Modeled, and Predicted Shoreline using the requested SPADS style:
+    1. Observed data: Discrete scatter points (s=10) filtered by real_date_str.
+    2. Predicted data: Continuous line (lw=1.6).
+    """
+    
+    cc_tr, rmse_tr, nrmse_tr, norm_std_tr, loss_tr = metrics['train']
+    cc_te, rmse_te, nrmse_te, norm_std_te, loss_te = metrics['test']
+    
+    # 1. Combine data for plotting
+    full_index = train_data.index.union(predict_data.index)
+    combined_plot_df = pd.DataFrame(index=full_index)
+    
+    # Reconstruct the full observation and prediction series
+    combined_plot_df['Observed'] = pd.concat([train_data['shore'], predict_data['shore']])
+    combined_plot_df['Predicted'] = pd.concat([pd.Series(S_sim_train, index=train_data.index), 
+                                                pd.Series(S_predict[:len(predict_data)], index=predict_data.index)])
+    
+    # Reconstruct the full real_date_str series for filtering
+    real_date_train = train_data.get('real_date_str', pd.Series(index=train_data.index, dtype=str))
+    real_date_predict = predict_data.get('real_date_str', pd.Series(index=predict_data.index, dtype=str))
+    
+    # Check if a non-null string exists for real_date
+    combined_plot_df['real_date_exists'] = pd.concat([real_date_train, real_date_predict]).notna()
+
+    # --- Filtering for Observed Scatter Plot (SPADS Strategy) ---
+    
+    # 1. Full Predicted Line (Used as continuous line)
+    full_predicted_line = combined_plot_df[combined_plot_df['Predicted'].notna()]
+    
+    # 2. Observed Scatter Points (Must have a valid Observation AND a corresponding real_date string)
+    observed_points_for_plot = combined_plot_df[combined_plot_df['real_date_exists'] & combined_plot_df['Observed'].notna()]
+
+    if full_predicted_line.empty: return
+
+    plt.figure(figsize=(14, 6))
+    
+    # Plot Observed data as discrete scatter points (SPADS style: s=10)
+    plt.scatter(observed_points_for_plot.index, observed_points_for_plot['Observed'], 
+                label='Observation (Real Dates)', color='blue', s=10)
+    
+    # Plot Predicted data as a continuous line (SPADS style: lw=1.6)
+    plt.plot(full_predicted_line.index, full_predicted_line['Predicted'], 
+             label=f'Y09 Model (Unified Wave Trend)', color='red', lw=1.6)
+    
+    # Highlight Prediction Period (as requested)
+    split_date = pd.Timestamp('2021-01-01')
+    if predict_data.index.min() < predict_data.index.max():
+         plt.axvspan(split_date, predict_data.index.max(), color='gray', alpha=0.3, label='Prediction Period')
+    
+    # Metric text box (using your requested format)
+    txt = (f"Train -> CC={cc_tr:.4f}  NRMSE={nrmse_tr:.4f}  NormStd={norm_std_tr:.4f}  Loss={loss_tr:.4f}\n"
+           f"Test  -> CC={cc_te:.4f}  NRMSE={nrmse_te:.4f}  NormStd={norm_std_te:.4f}  Loss={loss_te:.4f}")
+
+    plt.text(0.99, 0.01, txt, transform=plt.gca().transAxes, ha='right', va='bottom', fontsize=9.5,
+             bbox=dict(facecolor='white', alpha=0.9, edgecolor='black'))
+
+    plt.title(f'{beach_id} — Y09 Equilibrium Model (Unified Wave-Based Trend)')
+    plt.xlabel('Date'); plt.ylabel('Shoreline Position (m)')
+    plt.legend(loc='lower left')
+    plt.grid(True, ls='--', alpha=0.6)
+    plt.tight_layout()
+    
+    output_path = output_folder / f"{beach_id}_Y09_plot.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+# ==============================================================
+# 4. Y09 BATCH RUNNER
+# ==============================================================
+
+def run_y09_for_file(input_csv_path: Path, wave_nc_path: Path, output_dir_base: Path, region_name: str, parent_dir: Path):
+    """
+    Runs the full Y09 pipeline for a single input file and collects metrics.
+    """
+    warnings.filterwarnings('ignore', category=UserWarning) 
+    
+    beach_id = input_csv_path.stem.split("_")[0] 
+    
+    output_folder = output_dir_base / region_name
+    output_folder.mkdir(parents=True, exist_ok=True)
+    
+    logging.info("=" * 60)
+    logging.info(f"STARTING Y09 MODEL FOR: {beach_id} (Region: {region_name}) [Unified Wave Trend]")
+    
+    metrics_entry = {'region': region_name, 'beach_id': beach_id}
+    
+    try:
+        # 1. Load and Merge Data
+        data = load_and_merge_data(input_csv_path, wave_nc_path)
+        
+        # 2. Split and Prepare Data (Wave-Based trend detection)
+        SPLIT_DATE = '2020-12-31'
+        # trend_model is the LinearRegression object
+        train_data, predict_data, S_obs, S_obs_detrended, trend, trend_model = split_and_prepare_data(data, split_date=SPLIT_DATE)
+        
+        # 3. Optimization
+        param_bounds = [(-2, 1), (0, 6), (0, 5), (0, 5)] 
+        initial_params = [-1.5, 3, 2.5, 2.5]
+        
+        # NOTE: S_obs_detrended[0] is the starting point for the detrended simulation
+        result = optimize_parameters(initial_params, param_bounds, S_obs_detrended[0], train_data['wave_energy'].values, trend, S_obs)
+        if not result.success:
+             initial_params_2 = [np.mean(b) for b in param_bounds]
+             result = optimize_parameters(initial_params_2, param_bounds, S_obs_detrended[0], train_data['wave_energy'].values, trend, S_obs)
+             if not result.success: raise RuntimeError(f"Optimization failed: {result.message}")
+                 
+        a_opt, b_opt, C_plus_opt, C_minus_opt = result.x
+        logging.info(f"{beach_id}: Params: a={a_opt:.4f}, b={b_opt:.2f}, C+={C_plus_opt:.4f}, C-={C_minus_opt:.4f}")
+        
+        # 4. Training Simulation
+        model = EquilibriumShorelineModel(a_opt, b_opt, C_plus_opt, C_minus_opt)
+        S_sim_train_detrended = model.simulate(S_obs_detrended[0], train_data['wave_energy'].values)
+        S_sim_train = S_sim_train_detrended + trend # Re-add wave-based trend for final training fit
+        
+        # 5. Prediction (Unified Wave-Based Trend)
+        E_predict = predict_data['wave_energy'].values
+        S_predict_detrended = model.simulate(S_sim_train_detrended[-1], E_predict)
+        
+        # --- LOGIC FOR UNIFIED WAVE-BASED PREDICTION (with Anchoring) ---
+        
+        if trend_model:
+            X_predict = predict_data[['wave_energy']].values
+            
+            # Predict the trend directly using the trained model (Unified)
+            trend_predict_raw = trend_model.predict(X_predict).flatten()
+            
+            # Calculate the offset to ensure smooth transition (Anchoring)
+            X_last_train = train_data[['wave_energy']].iloc[-1].values.reshape(1, -1)
+            trend_predicted_at_last_day = trend_model.predict(X_last_train)[0]
+            
+            # Offset = Actual Wave Trend Value at end of training - Model's Wave Trend Value at end of training
+            offset = trend[-1] - trend_predicted_at_last_day
+            
+            # Apply the offset to all future trend predictions
+            trend_predict = trend_predict_raw + offset
+            
+        else:
+            # Fallback if training failed
+            trend_predict = np.zeros(len(E_predict))
+        
+        # Align prediction lengths
+        min_len_pred = min(len(predict_data), len(S_predict_detrended), len(trend_predict))
+        S_predict_detrended = S_predict_detrended[:min_len_pred]
+        trend_predict = trend_predict[:min_len_pred]
+        S_predict = S_predict_detrended + trend_predict
+        
+        # 6. Calculate Metrics (SPADS Strategy: Filtered by Real Date)
+        
+        # Create full observed/predicted series
+        full_S_obs = np.concatenate([S_obs, predict_data['shore'].values])
+        full_S_sim = np.concatenate([S_sim_train, S_predict])
+        
+        # Get the real_date_str column from the original combined data frame
+        real_date_exists = data['real_date_str'].notna().values[:len(full_S_obs)]
+        
+        # Apply filter to observed and simulated data
+        S_obs_filtered = full_S_obs[real_date_exists]
+        S_sim_filtered = full_S_sim[real_date_exists]
+        
+        # Determine the length of the training set after filtering
+        train_len = len(train_data[train_data['real_date_str'].notna()])
+        
+        S_obs_tr_filtered = S_obs_filtered[:train_len]
+        S_sim_tr_filtered = S_sim_filtered[:train_len]
+        S_obs_te_filtered = S_obs_filtered[train_len:]
+        S_sim_te_filtered = S_sim_filtered[train_len:]
+        
+        metrics_dict_tr, metrics_tuple_tr = calculate_metrics(S_obs_tr_filtered, S_sim_tr_filtered)
+        metrics_dict_te, metrics_tuple_te = calculate_metrics(S_obs_te_filtered, S_sim_te_filtered)
+        
+        # 7. Save Final Results CSV (Simplified Output)
+        predicted_full = pd.concat([pd.Series(S_sim_train, index=train_data.index, name='Prediction'), 
+                                    pd.Series(S_predict, index=predict_data.index[:min_len_pred], name='Prediction')])
+        
+        final_output_df = pd.DataFrame(index=data.index)
+        final_output_df['Observation'] = data['shore']
+        final_output_df['Prediction'] = predicted_full
+        
+        if 'real_date_str' in data.columns:
+             final_output_df['real_date'] = data['real_date_str']
+
+        final_output_df.index.name = 'date'
+        
+        output_csv_path = output_folder / f"{beach_id}_Y09_results.csv"
+        final_output_df.dropna(subset=['Observation', 'Prediction'], how='all').to_csv(output_csv_path)
+
+        # 8. Plot Results (uses SPADS scatter/line strategy)
+        metrics_plot = {'train': metrics_tuple_tr, 'test': metrics_tuple_te}
+        plot_results_new_style(beach_id, train_data, predict_data.iloc[:min_len_pred], S_obs, S_sim_train, S_predict, None, metrics_plot, output_folder)
+        
+        # 9. Collect Metrics for Summary
+        metrics_entry.update({
+            'a_opt': round(a_opt, 4), 'b_opt': round(b_opt, 4), 
+            'C_plus_opt': round(C_plus_opt, 4), 'C_minus_opt': round(C_minus_opt, 4),
+            'train_cc': metrics_dict_tr['cc'], 'train_nrmse': metrics_dict_tr['norm_rmse'], 'train_norm_std': metrics_dict_tr.get('norm_std', np.nan), 'train_loss': metrics_dict_tr['loss'],
+            'test_cc': metrics_dict_te['cc'], 'test_nrmse': metrics_dict_te['norm_rmse'], 'test_norm_std': metrics_dict_te.get('norm_std', np.nan), 'test_loss': metrics_dict_te['loss']
+        })
+        ALL_METRICS.append(metrics_entry)
+        logging.info(f"{beach_id}: Test CC (Real Dates)={metrics_dict_te['cc']:.3f}, Test NRMSE={metrics_dict_te['norm_rmse']:.3f}")
+
+    except Exception as e:
+        metrics_entry.update({'a_opt': np.nan, 'b_opt': np.nan, 'C_plus_opt': np.nan, 'C_minus_opt': np.nan, 'error': str(e)})
+        ALL_METRICS.append(metrics_entry)
+        logging.error(f"FATAL ERROR processing {beach_id}: {e}")
+        
+    warnings.filterwarnings('default', category=UserWarning)
+
+# ==============================================================
+# 5. MAIN BATCH RUNNER
+# ==============================================================
+
+def main_runner_y09():
+    """Main function to run Y09 in batch mode with full integration."""
+    
+    # --- GLOBAL CONFIGURATION ---
+    PARENT_DIR = Path(r"C:\Users\amgh628\Downloads\Shoreline_calssified") 
+    REGION_DIRS = ["SW_new2", "SE_new","NW_new","NE_new"]                 
+    WAVE_NC_PATH = PARENT_DIR / "NZ_wave_coastal_daily_merged.nc"         
+    # NOTE: Output folder name reflects the unified wave-based method + real date metrics
+    OUTPUT_DIR_BASE = PARENT_DIR / "Y09_Automated_Results_UnifiedWaveTrend_RealDateMetrics_3"                     
+    
+    OUTPUT_DIR_BASE.mkdir(parents=True, exist_ok=True)
+    
+    logging.info("=" * 80)
+    logging.info(f"Y09 BATCH RUNNER (Unified Wave-Based Trend, Metrics on Real Dates)")
+    logging.info(f"Base Output directory: {OUTPUT_DIR_BASE}")
+    logging.info(f"Wave NetCDF: {WAVE_NC_PATH}")
+    logging.info("=" * 80)
+    
+    if not WAVE_NC_PATH.exists():
+        logging.error(f"Wave NetCDF not found: {WAVE_NC_PATH}")
+        return
+
+    try:
+        # Step 1: Initialize the global KD-Tree (done only once)
+        initialize_global_kd_tree(WAVE_NC_PATH)
+    except Exception:
+        logging.error(f"Failed to set up global KD-Tree. Aborting run.")
+        return
+
+    total_files = 0
+    processed_count = 0
+    
+    # Step 2: Run batch processing
+    for region in REGION_DIRS:
+        region_path = PARENT_DIR / region
+        logging.info("\n" + "#" * 50)
+        logging.info(f"PROCESSING REGION: {region_path.name}")
+        logging.info("#" * 50)
+
+        if not region_path.exists():
+            logging.warning(f"Region folder does not exist, skipping: {region_path}")
+            continue
+
+        shoreline_files = sorted(region_path.glob("*_shoreline_final.csv"))
+        if not shoreline_files:
+            shoreline_files = sorted(region_path.glob("*_shoreline_smoothed_final.csv"))
+            if not shoreline_files:
+                logging.info("No shoreline files found.")
+                continue
+
+        for csv_path in tqdm(shoreline_files, desc=f"Modeling files in {region}"):
+            try:
+                # Pass both the base output directory and the current region name
+                run_y09_for_file(csv_path, WAVE_NC_PATH, OUTPUT_DIR_BASE, region, PARENT_DIR)
+                processed_count += 1
+            except Exception as e:
+                # Error is logged inside run_y09_for_file, continue the loop
+                pass 
+    
+    # Step 3: Save Summary Metrics
+    if ALL_METRICS:
+        metrics_df = pd.DataFrame(ALL_METRICS)
+        # NOTE: Updated summary file name
+        summary_path = PARENT_DIR / "Y09_Automated_Metrics" / "ALL_REGIONS_summary_UnifiedWaveTrend_RealDateMetrics_3.csv"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_df.to_csv(summary_path, index=False)
+        
+        logging.info("=" * 80)
+        logging.info(f"BATCH RUN COMPLETE. Processed {processed_count}/{total_files} files.")
+        logging.info(f"Summary saved to: {summary_path}")
+        logging.info("=" * 80)
+    else:
+        logging.info("Batch run complete, but no metrics were collected.")
+
+# Execute the main runner
+if __name__ == "__main__":
+    main_runner_y09()
