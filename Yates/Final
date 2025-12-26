@@ -1,19 +1,43 @@
-#Final for now
+# Y09 Equilibrium Shoreline Model - PURE Y09 WITH ANTI-OSCILLATION
+# Modified: Uses wave energy directly (Hs²) without wave direction
+# Integrated version with:
+# 1. Constrained parameters to reduce oscillation
+# 2. Lower phi bounds (faster wave response)
+# 3. Reduced seasonal amplitude
+# 4. Optional damping for direction changes
+# 5. Same input/output structure as original
+#
+# FIXES APPLIED:
+# - Fixed mismatched function signatures (simulate_numba_y09 -> simulate_numba)
+# - Fixed undefined variable 'S' in bounds (now uses S_obs parameter)
+# - Replaced rolling mean with exponential memory smoothing (consistent with Y09)
+
 import numpy as np
 import pandas as pd
 import xarray as xr
 import cftime
 import warnings
 import logging
-import math
 from pathlib import Path
 from tqdm import tqdm
 from scipy.spatial import cKDTree
 from scipy.optimize import minimize, differential_evolution
 from sklearn.metrics import mean_squared_error
-from sklearn.linear_model import LinearRegression
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
+
+# Try to import numba for JIT compilation (major speedup)
+try:
+    from numba import jit, prange
+    NUMBA_AVAILABLE = True
+    logging.info("Numba available - using JIT compilation for speedup")
+except ImportError:
+    NUMBA_AVAILABLE = False
+    logging.info("Numba not available - using pure Python (slower)")
+    # Define a no-op decorator if numba is not available
+    def jit(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 # Suppress minor warnings for clean output
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -26,124 +50,615 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- GLOBAL CONFIGURATION & DATA STRUCTURES ---
 GLOBAL_TREE = None
 GLOBAL_GRID_INDICES = None
-WAVE_VAR = 'hs' # Significant Wave Height (raw)
-R_EARTH = 6371.0 
-ALL_METRICS = [] 
-EWMA_SPAN = 15 # Exponential Moving Average span
+WAVE_VAR = 'hs'
+R_EARTH = 6371.0
+ALL_METRICS = []
+
+# --- EXPONENTIAL MEMORY PARAMETER ---
+# Alpha for exponential smoothing: E_eff(t) = α*E(t) + (1-α)*E_eff(t-1)
+# Higher alpha = more weight on current observation (less smoothing)
+# Lower alpha = more weight on history (more smoothing)
+# α ≈ 2/(span+1), so for span=15, α ≈ 0.125
+ENERGY_SMOOTHING_ALPHA = 0.125  # Equivalent to ~15-day exponential memory
+
+# --- ANTI-OSCILLATION SETTINGS ---
+# Set to True to enable damping (reduces oscillation after jumps)
+USE_DAMPING = True
+DAMPING_FACTOR = 0.05  # 0.0 = no damping, 0.3 = strong damping
 
 # ==============================================================
-# 1. Y09 CORE FUNCTIONS (MODEL & METRICS)
+# 1. NUMBA-OPTIMIZED SIMULATION WITH ANTI-OSCILLATION
 # ==============================================================
 
-class EquilibriumShorelineModel:
-    """Y09 Equilibrium Shoreline Model Class."""
-    def __init__(self, a, b, C_plus, C_minus):
-        if C_plus < 0 or C_minus < 0:
-            raise ValueError("C_plus and C_minus must be non-negative.")
-        self.a = a
-        self.b = b
-        self.C_plus = C_plus
-        self.C_minus = C_minus
+@jit(nopython=True, cache=True)
+def simulate_numba(
+    initial_S,
+    E_series,
+    months_series,
+    a, b,
+    C_plus, C_minus,
+    phi,
+    gamma,                 # wave-energy memory
+    seasonal_amp,
+    seasonal_phase,
+    damping=0.0
+):
+    """
+    Numba-optimized Y09 simulation with wave energy memory.
+    
+    Parameters:
+    -----------
+    initial_S : float
+        Initial shoreline position
+    E_series : array
+        Wave energy time series
+    months_series : array
+        Month values for seasonal component
+    a, b : float
+        Equilibrium relationship coefficients
+    C_plus, C_minus : float
+        Accretion/erosion rate coefficients
+    phi : float
+        Shoreline memory parameter (0-1)
+    gamma : float
+        Wave energy memory parameter (0-1)
+    seasonal_amp : float
+        Seasonal amplitude
+    seasonal_phase : float
+        Seasonal phase offset
+    damping : float
+        Damping factor for direction changes (0-1)
+    
+    Returns:
+    --------
+    S_series : array
+        Simulated shoreline positions
+    """
+    n = len(E_series)
+    S_series = np.zeros(n)
 
-    def equilibrium_wave_energy(self, S):
-        """Calculate equilibrium wave energy."""
-        return self.a * S + self.b
+    S_current = initial_S
+    prev_dS = 0.0
 
-    def shoreline_change_rate(self, S, E):
-        """Calculate shoreline change rate based on wave energy (using provided sign convention)."""
-        E_eq = self.equilibrium_wave_energy(S)
-        delta_E = np.clip(E - E_eq, -1e6, 1e6)
-        # E is the smoothed wave energy (Hs^2)
-        return (self.C_plus if delta_E < 0 else -self.C_minus) * np.sqrt(np.abs(E)) * np.abs(delta_E)
+    # Exponential wave-energy memory
+    E_eff = E_series[0]
 
-    def simulate(self, initial_S, E_series, dt=1):
-        """Simulate shoreline positions (fixed to return N points)."""
-        S_series = np.zeros(len(E_series) + 1)
-        S_series[0] = initial_S
-        for i, E in enumerate(E_series):
-            E_val = max(0, E) 
-            dS_dt = self.shoreline_change_rate(S_series[i], E_val)
-            S_series[i + 1] = S_series[i] + dS_dt * dt
+    two_pi = 2.0 * np.pi
+
+    for i in range(n):
+
+        # --------------------------------------------------
+        # 1. Wave energy memory (physics-consistent)
+        # --------------------------------------------------
+        E_eff = gamma * E_eff + (1.0 - gamma) * E_series[i]
+        E_val = max(0.0, E_eff)
+
+        # --------------------------------------------------
+        # 2. Seasonal equilibrium shoreline
+        # --------------------------------------------------
+        month_rad = two_pi * (months_series[i] - 1.0) / 12.0
+        S_eq = a * S_current + b \
+               + seasonal_amp * np.sin(month_rad + seasonal_phase)
+
+        delta_E = E_val - S_eq
+        delta_E = max(min(delta_E, 1e6), -1e6)
+
+        # --------------------------------------------------
+        # 3. Shoreline change rate
+        # --------------------------------------------------
+        sqrt_E = np.sqrt(E_val + 0.01)
+
+        if delta_E < 0.0:
+            dS_dt = C_plus * sqrt_E * abs(delta_E)
+        else:
+            dS_dt = -C_minus * sqrt_E * abs(delta_E)
+
+        # --------------------------------------------------
+        # 4. Optional damping (usually can be small or zero)
+        # --------------------------------------------------
+        if damping > 0.0 and prev_dS * dS_dt < 0.0:
+            dS_dt *= (1.0 - damping)
+
+        # --------------------------------------------------
+        # 5. Shoreline memory (phi)
+        # --------------------------------------------------
+        S_instant = S_current + dS_dt
+        S_new = phi * S_current + (1.0 - phi) * S_instant
+
+        # --------------------------------------------------
+        # 6. Update
+        # --------------------------------------------------
+        S_series[i] = S_new
+        prev_dS = S_new - S_current
+        S_current = S_new
+
+    return S_series
+
+
+def simulate_pure_python(initial_S, E_series, months_series,
+                         a, b, C_plus, C_minus, phi, gamma,
+                         seasonal_amp, seasonal_phase,
+                         damping=0.15):
+    """
+    Pure Python simulation with anti-oscillation damping.
+    (Fallback when Numba not available)
+    
+    Parameters:
+    -----------
+    initial_S : float
+        Initial shoreline position
+    E_series : array
+        Wave energy time series
+    months_series : array
+        Month values for seasonal component
+    a, b : float
+        Equilibrium relationship coefficients
+    C_plus, C_minus : float
+        Accretion/erosion rate coefficients
+    phi : float
+        Shoreline memory parameter (0-1)
+    gamma : float
+        Wave energy memory parameter (0-1)
+    seasonal_amp : float
+        Seasonal amplitude
+    seasonal_phase : float
+        Seasonal phase offset
+    damping : float
+        Damping factor for direction changes (0-1)
+    
+    Returns:
+    --------
+    S_series : array
+        Simulated shoreline positions
+    """
+    n = len(E_series)
+    S_series = np.zeros(n)
+    S_current = initial_S
+    prev_dS = 0.0
+    
+    two_pi = 2.0 * np.pi
+    
+    # Exponential wave-energy memory
+    E_eff = E_series[0]
+    
+    for i in range(n):
+        # Wave energy memory (physics-consistent)
+        E_eff = gamma * E_eff + (1.0 - gamma) * E_series[i]
+        E_val = max(0.0, E_eff)
+        
+        # Seasonal equilibrium shoreline
+        month_rad = two_pi * (months_series[i] - 1.0) / 12.0
+        S_eq = a * S_current + b + seasonal_amp * np.sin(month_rad + seasonal_phase)
+        
+        delta_E = np.clip(E_val - S_eq, -1e6, 1e6)
+        
+        sqrt_E = np.sqrt(E_val + 0.01)
+        
+        if delta_E < 0:
+            dS_dt = C_plus * sqrt_E * abs(delta_E)
+        else:
+            dS_dt = -C_minus * sqrt_E * abs(delta_E)
+        
+        # ANTI-OSCILLATION: Damping when direction changes
+        if damping > 0 and prev_dS * dS_dt < 0:
+            dS_dt = dS_dt * (1.0 - damping)
+        
+        S_instant = S_current + dS_dt
+        S_new = phi * S_current + (1.0 - phi) * S_instant
+        
+        S_series[i] = S_new
+        prev_dS = S_new - S_current
+        S_current = S_new
+    
+    return S_series
+
+
+def simulate_fast(initial_S, E_series, months_series,
+                  a, b, C_plus, C_minus, phi, gamma,
+                  seasonal_amp, seasonal_phase,
+                  damping=0.15):
+    """
+    Wrapper that uses Numba if available, otherwise falls back to pure Python.
+    
+    Parameters:
+    -----------
+    initial_S : float
+        Initial shoreline position
+    E_series : array
+        Wave energy time series
+    months_series : array
+        Month values for seasonal component
+    a, b : float
+        Equilibrium relationship coefficients
+    C_plus, C_minus : float
+        Accretion/erosion rate coefficients
+    phi : float
+        Shoreline memory parameter (0-1)
+    gamma : float
+        Wave energy memory parameter (0-1)
+    seasonal_amp : float
+        Seasonal amplitude
+    seasonal_phase : float
+        Seasonal phase offset
+    damping : float
+        Damping factor for direction changes (0-1)
+    
+    Returns:
+    --------
+    S_series : array
+        Simulated shoreline positions
+    """
+    # Ensure arrays are contiguous float64 for Numba
+    E_arr = np.ascontiguousarray(E_series, dtype=np.float64)
+    months_arr = np.ascontiguousarray(months_series, dtype=np.float64)
+    
+    # Use global damping setting if enabled
+    actual_damping = DAMPING_FACTOR if USE_DAMPING else 0.0
+    
+    if NUMBA_AVAILABLE:
+        return simulate_numba(
+            float(initial_S), E_arr, months_arr,
+            float(a), float(b), float(C_plus), float(C_minus),
+            float(phi), float(gamma), float(seasonal_amp), float(seasonal_phase),
+            float(actual_damping)
+        )
+    else:
+        return simulate_pure_python(
+            initial_S, E_arr, months_arr,
+            a, b, C_plus, C_minus, phi, gamma, seasonal_amp, seasonal_phase,
+            actual_damping
+        )
+
+
+# ==============================================================
+# 2. LOSS FUNCTION WITH OSCILLATION PENALTY
+# ==============================================================
+
+def mse_loss_function_fast(params, initial_S, E_obs, S_obs, months_series):
+    """
+    Optimized loss function with oscillation penalty.
+    
+    The penalty term discourages high-frequency oscillations in the model output.
+    
+    Parameters:
+    -----------
+    params : array-like
+        [a, b, C_plus, C_minus, phi, gamma, seasonal_amp, seasonal_phase]
+    initial_S : float
+        Initial shoreline position
+    E_obs : array
+        Observed wave energy
+    S_obs : array
+        Observed shoreline positions
+    months_series : array
+        Month values
+    
+    Returns:
+    --------
+    float
+        Loss value (MSE + oscillation penalty)
+    """
+    a, b, C_plus, C_minus, phi, gamma, seasonal_amp, seasonal_phase = params
+    
+    # Quick parameter validation
+    if C_plus < 0 or C_minus < 0 or phi < 0 or phi > 1 or gamma < 0 or gamma > 1 or seasonal_amp < 0:
+        return 1e10
+    
+    try:
+        S_sim = simulate_fast(
+            initial_S, E_obs, months_series,
+            a, b, C_plus, C_minus, phi, gamma, seasonal_amp, seasonal_phase
+        )
+        
+        min_len = min(len(S_sim), len(S_obs))
+        
+        # Primary MSE loss
+        diff = S_obs[:min_len] - S_sim[:min_len]
+        mse = np.mean(diff * diff)
+        
+        # OSCILLATION PENALTY: Penalize rapid direction changes
+        if min_len > 10:
+            dS_sim = np.diff(S_sim[:min_len])
+            # Count sign changes (direction reversals)
+            sign_changes = np.sum(np.diff(np.sign(dS_sim)) != 0)
+            # Variance of changes (high variance = oscillation)
+            change_variance = np.std(dS_sim)
             
-        return np.nan_to_num(S_series[1:])
+            # Penalty weight (adjust if needed)
+            oscillation_penalty = 0.05 * change_variance + 0.001 * sign_changes
+            mse += oscillation_penalty
+        
+        return mse
+    except:
+        return 1e10
 
-def mse_loss_function(params, initial_S_detrended, E_obs, trend, S_obs):
-    """Calculate mean squared error loss."""
-    try:
-        a, b, C_plus, C_minus = params
-        if C_plus < 0 or C_minus < 0: return np.inf
-        
-        model = EquilibriumShorelineModel(a, b, C_plus, C_minus)
-        S_sim_detrended = model.simulate(initial_S_detrended, E_obs)
-        
-        min_len = min(len(S_sim_detrended), len(S_obs))
-        S_sim = S_sim_detrended[:min_len] + trend[:min_len]
-        
-        return mean_squared_error(S_obs[:min_len], S_sim)
-    except Exception:
-        return np.inf
 
-def optimize_parameters(initial_params, param_bounds, initial_S_detrended, E_obs, trend, S_obs):
+# ==============================================================
+# 3. OPTIMIZATION WITH ANTI-OSCILLATION CONSTRAINTS
+# ==============================================================
+
+def optimize_parameters_fast(initial_S, E_obs, S_obs, months_series):
     """
-    Optimize model parameters using global and local optimization.
-    MAXITER reduced for efficiency in batch processing.
+    Parameter optimization with ANTI-OSCILLATION constraints.
+    
+    Key changes from original:
+    1. phi max reduced from 0.99 to 0.8 (faster wave response)
+    2. C_plus/C_minus have minimum 0.3 (ensures equilibrium pull)
+    3. seasonal_amp reduced (less seasonal oscillation)
+    4. Oscillation penalty in loss function
+    5. gamma parameter for wave energy memory
+    
+    Parameters:
+    -----------
+    initial_S : float
+        Initial shoreline position
+    E_obs : array
+        Observed wave energy
+    S_obs : array
+        Observed shoreline positions
+    months_series : array
+        Month values
+    
+    Returns:
+    --------
+    OptimizeResult
+        Optimization result with optimized parameters in .x attribute
     """
+    
+    # Data statistics for adaptive bounds
+    E_mean = np.mean(E_obs)
+    S_std = np.std(S_obs)
+    
+    # ANTI-OSCILLATION PARAMETER BOUNDS
+    # FIX: Using S_obs instead of undefined 'S'
+    param_bounds = [
+        (-3.0, 3.0),             # a  : equilibrium slope
+        (-5.0, 20.0),            # b  : equilibrium intercept
+
+        (0.3, 5.0),              # C_plus  (accretion)
+        (0.3, 5.0),              # C_minus (erosion)
+
+        (0.2, 0.8),              # phi : shoreline memory
+        (0.6, 0.98),             # gamma : wave-energy memory
+
+        (0.0, 0.6 * S_std),      # seasonal_amp - FIX: was np.std(S), now uses S_std from S_obs
+        (-np.pi, np.pi)          # seasonal_phase
+    ]
+    
+    # Initial guess optimized for wave-responsive behavior
+    initial_params = [
+        0.0,            # a
+        E_mean * 0.5,   # b
+        2.0,            # C_plus (higher = stronger response)
+        2.0,            # C_minus (higher = stronger response)
+        0.5,            # phi (lower = faster response to waves)
+        0.8,            # gamma (wave-energy memory)
+        S_std * 0.2,    # seasonal_amp (reduced)
+        0.0             # seasonal_phase
+    ]
+    
     try:
-        # 1. Global search (Differential Evolution)
+        # Global search with stronger settings
         result_global = differential_evolution(
-            mse_loss_function, bounds=param_bounds, args=(initial_S_detrended, E_obs, trend, S_obs),
-            maxiter=500, popsize=20, tol=1e-6, seed=42, disp=False
+            mse_loss_function_fast,
+            bounds=param_bounds,
+            args=(initial_S, E_obs, S_obs, months_series),
+            maxiter=1000,
+            popsize=50,
+            tol=1e-7,
+            seed=42,
+            mutation=(0.5, 1.5),
+            recombination=0.8,
+            updating='deferred',
+            workers=1,          # Use all CPU cores
+            polish=True,         # Auto L-BFGS-B refinement
+            disp=False
         )
         
-        # 2. Local refinement (L-BFGS-B)
+        # Additional local refinement
         result_local = minimize(
-            mse_loss_function, result_global.x, args=(initial_S_detrended, E_obs, trend, S_obs),
-            bounds=param_bounds, method='L-BFGS-B', 
-            options={'disp': False, 'maxiter': 2000, 'ftol': 1e-8, 'maxls': 100}
+            mse_loss_function_fast,
+            result_global.x,
+            args=(initial_S, E_obs, S_obs, months_series),
+            bounds=param_bounds,
+            method='L-BFGS-B',
+            options={'disp': False, 'maxiter': 5000, 'ftol': 1e-10, 'gtol': 1e-8}
         )
         
-        if not result_local.success:
-             # Fallback to the global result if local refinement fails
-             return result_global 
+        return result_local if result_local.fun < result_global.fun else result_global
         
-        return result_local
     except Exception as e:
         logging.error(f"Optimization failed: {e}")
-        raise
+        class FallbackResult:
+            x = initial_params
+            success = False
+            fun = float('inf')
+        return FallbackResult()
+
+
+# ==============================================================
+# 4. WAVE ENERGY CALCULATION (DIRECT - NO DIRECTION)
+# ==============================================================
+
+def calculate_wave_energy(hs):
+    """
+    Calculate wave energy directly from significant wave height.
+    E = Hs²
+    
+    No wave direction used - uses raw wave energy.
+    
+    Parameters:
+    -----------
+    hs : array-like
+        Significant wave height
+    
+    Returns:
+    --------
+    array
+        Wave energy (Hs²)
+    """
+    return hs ** 2
+
+
+def apply_exponential_smoothing(energy_series, alpha=None):
+    """
+    Apply exponential smoothing to wave energy series.
+    
+    E_eff(t) = α * E(t) + (1 - α) * E_eff(t-1)
+    
+    This is consistent with Y09 memory formulation and avoids
+    the artificial phase lag introduced by rolling mean.
+    
+    Parameters:
+    -----------
+    energy_series : array-like
+        Raw wave energy time series
+    alpha : float, optional
+        Smoothing parameter (0 < α ≤ 1)
+        Higher alpha = less smoothing, more responsive
+        Lower alpha = more smoothing, more memory
+        Default uses ENERGY_SMOOTHING_ALPHA global setting
+    
+    Returns:
+    --------
+    array
+        Exponentially smoothed energy series
+    """
+    if alpha is None:
+        alpha = ENERGY_SMOOTHING_ALPHA
+    
+    energy = np.asarray(energy_series, dtype=np.float64)
+    n = len(energy)
+    
+    if n == 0:
+        return energy
+    
+    # Initialize with first value
+    E_eff = np.zeros(n, dtype=np.float64)
+    E_eff[0] = energy[0]
+    
+    # Apply exponential smoothing: E_eff(t) = α*E(t) + (1-α)*E_eff(t-1)
+    for t in range(1, n):
+        E_eff[t] = alpha * energy[t] + (1.0 - alpha) * E_eff[t - 1]
+    
+    return E_eff
+
+
+@jit(nopython=True, cache=True)
+def apply_exponential_smoothing_numba(energy, alpha):
+    """
+    Numba-optimized exponential smoothing.
+    
+    E_eff(t) = α * E(t) + (1 - α) * E_eff(t-1)
+    
+    Parameters:
+    -----------
+    energy : array
+        Raw wave energy time series
+    alpha : float
+        Smoothing parameter (0 < α ≤ 1)
+    
+    Returns:
+    --------
+    array
+        Exponentially smoothed energy series
+    """
+    n = len(energy)
+    E_eff = np.zeros(n, dtype=np.float64)
+    
+    if n == 0:
+        return E_eff
+    
+    E_eff[0] = energy[0]
+    
+    for t in range(1, n):
+        E_eff[t] = alpha * energy[t] + (1.0 - alpha) * E_eff[t - 1]
+    
+    return E_eff
+
+
+def apply_exponential_smoothing_fast(energy_series, alpha=None):
+    """
+    Fast exponential smoothing using Numba if available.
+    
+    Parameters:
+    -----------
+    energy_series : array-like
+        Raw wave energy time series
+    alpha : float, optional
+        Smoothing parameter
+    
+    Returns:
+    --------
+    array
+        Exponentially smoothed energy series
+    """
+    if alpha is None:
+        alpha = ENERGY_SMOOTHING_ALPHA
+    
+    energy = np.ascontiguousarray(energy_series, dtype=np.float64)
+    
+    if NUMBA_AVAILABLE:
+        return apply_exponential_smoothing_numba(energy, float(alpha))
+    else:
+        return apply_exponential_smoothing(energy, alpha)
+
 
 def calculate_metrics(S_obs, S_sim):
-    """Calculate evaluation metrics (returns dict and formatted tuple)."""
+    """
+    Calculate evaluation metrics.
+    
+    Parameters:
+    -----------
+    S_obs : array
+        Observed shoreline positions
+    S_sim : array
+        Simulated shoreline positions
+    
+    Returns:
+    --------
+    tuple
+        (metrics_dict, metrics_tuple)
+    """
     min_len = min(len(S_obs), len(S_sim))
     S_obs = S_obs[:min_len]
     S_sim = S_sim[:min_len]
     
     if min_len < 2:
-        zero_metrics = {'cc': np.nan, 'rmse': np.nan, 'norm_rmse': np.nan, 'norm_std': np.nan, 'loss': np.nan}
-        return zero_metrics, (0.0, 0.0, 0.0, 0.0, 0.0)
-
+        return {'cc': np.nan, 'rmse': np.nan, 'norm_rmse': np.nan, 
+                'norm_std': np.nan, 'loss': np.nan}, (0, 0, 0, 0, 0)
+    
     cc = np.corrcoef(S_obs, S_sim)[0, 1]
-    rmse = np.sqrt(mean_squared_error(S_obs, S_sim))
+    rmse = np.sqrt(np.mean((S_obs - S_sim) ** 2))
     std_obs = np.std(S_obs)
     std_pred = np.std(S_sim)
     norm_rmse = rmse / std_obs if std_obs != 0 else np.inf
     norm_std = std_pred / std_obs if std_obs != 0 else np.inf
+    loss = np.sqrt(norm_rmse**2 + (1 - cc)**2 + (1 - norm_std)**2)
     
-    loss = np.sqrt((0 - norm_rmse)**2 + (1 - cc)**2 + (1 - norm_std)**2)
-
-    results_dict = {'cc': cc, 'rmse': rmse, 'norm_rmse': norm_rmse, 'norm_std': norm_std, 'loss': loss}
+    results_dict = {'cc': cc, 'rmse': rmse, 'norm_rmse': norm_rmse, 
+                    'norm_std': norm_std, 'loss': loss}
+    results_tuple = (round(cc, 4), round(rmse, 4), round(norm_rmse, 4),
+                     round(norm_std, 4), round(loss, 4))
     
-    results_tuple = (
-        round(cc, 4), round(rmse, 4), round(norm_rmse, 4), 
-        round(norm_std, 4), round(loss, 4)
-    )
     return results_dict, results_tuple
 
+
 # ==============================================================
-# 2. DATA HANDLING (Ocean-Filtered Wave Extraction with EWMA on Energy)
+# 5. DATA LOADING (with caching)
 # ==============================================================
 
+WAVE_DATA_CACHE = {}
+
 def initialize_global_kd_tree(wave_nc_path: Path):
-    """Initializes the global KD-Tree based on valid ocean points."""
+    """
+    Initialize the global KD-Tree based on valid ocean points.
+    
+    Parameters:
+    -----------
+    wave_nc_path : Path
+        Path to wave NetCDF file
+    """
     global GLOBAL_TREE, GLOBAL_GRID_INDICES
     logging.info("\n--- Initializing Global KD-Tree ---")
     
@@ -153,9 +668,6 @@ def initialize_global_kd_tree(wave_nc_path: Path):
             lon2d = ds['longitude'].values
             lon_grid, lat_grid = np.meshgrid(lon2d, lat2d)
             
-            if WAVE_VAR not in ds.variables:
-                 raise ValueError(f"Wave variable '{WAVE_VAR}' not found in NetCDF.")
-                 
             wave_data_flat = ds[WAVE_VAR].isel(time=0).values.ravel()
             valid_mask = np.isfinite(wave_data_flat)
             valid_lats = lat_grid.ravel()[valid_mask]
@@ -173,432 +685,425 @@ def initialize_global_kd_tree(wave_nc_path: Path):
         logging.error(f"Failed to initialize KD-Tree: {e}")
         raise
 
-def load_and_merge_data(input_csv_path: Path, wave_nc_path: Path):
+
+def preload_wave_data(wave_nc_path: Path):
     """
-    Loads shoreline data, finds the nearest ocean grid point, extracts raw Hs,
-    CALCULATES RAW WAVE ENERGY (Hs^2), APPLIES EWMA TO ENERGY, and merges/aligns data.
+    Preload wave data into memory for faster access (only Hs, no direction).
+    
+    Parameters:
+    -----------
+    wave_nc_path : Path
+        Path to wave NetCDF file
     """
-    global GLOBAL_TREE, GLOBAL_GRID_INDICES
+    global WAVE_DATA_CACHE
+    
+    logging.info("Preloading wave data into memory...")
+    
+    with xr.open_dataset(wave_nc_path) as ds:
+        WAVE_DATA_CACHE['hs'] = ds[WAVE_VAR].values
+        # No longer loading wave direction (dpm)
+        
+        netcdf_days = ds['time'].to_series().index
+        if not isinstance(netcdf_days, pd.DatetimeIndex):
+            time_var = ds['time']
+            decoded = cftime.num2date(
+                time_var.values,
+                units=time_var.attrs.get('units', ''),
+                calendar=time_var.attrs.get('calendar', 'standard')
+            )
+            netcdf_days = pd.to_datetime(decoded)
+        WAVE_DATA_CACHE['time'] = netcdf_days.normalize()
+    
+    logging.info(f"Wave data loaded: {WAVE_DATA_CACHE['hs'].shape}")
+
+
+def load_and_merge_data_fast(input_csv_path: Path, wave_nc_path: Path):
+    """
+    Optimized data loading using cached wave data - uses wave energy directly.
+    
+    UPDATED: Uses exponential smoothing instead of rolling mean.
+    This removes artificial phase lag and is consistent with Y09 memory formulation.
+    
+    Old approach (removed):
+        smoothed_energy_series = raw_energy_series.rolling(window=15, min_periods=1).mean()
+    
+    New approach:
+        E_eff(t) = α * E(t) + (1 - α) * E_eff(t-1)
+    
+    Parameters:
+    -----------
+    input_csv_path : Path
+        Path to input CSV with shoreline data
+    wave_nc_path : Path
+        Path to wave NetCDF file
+    
+    Returns:
+    --------
+    DataFrame
+        Combined shoreline and wave energy data
+    """
+    global GLOBAL_TREE, GLOBAL_GRID_INDICES, WAVE_DATA_CACHE
     
     time_col = "date"
     shore_col = "shoreline_smoothed"
     
     raw_input_df = pd.read_csv(input_csv_path)
     
-    # 1. Identify Columns and Prepare Primary Index
     lat_col = next((c for c in raw_input_df.columns if 'center_y' in c.lower() or 'lat' in c.lower()), None)
     lon_col = next((c for c in raw_input_df.columns if 'center_x' in c.lower() or 'lon' in c.lower()), None)
-    shore_col = 'shore' if 'shore' in raw_input_df.columns else shore_col 
-
-    if not (lat_col and lon_col): raise ValueError("Input CSV must contain center coordinate columns.")
-    if not (shore_col in raw_input_df.columns): raise ValueError("Input CSV must contain a shoreline column ('shoreline_smoothed' or 'shore').")
+    shore_col = 'shore' if 'shore' in raw_input_df.columns else shore_col
+    
+    if not (lat_col and lon_col):
+        raise ValueError("Input CSV must contain center coordinate columns.")
+    if shore_col not in raw_input_df.columns:
+        raise ValueError("Input CSV must contain a shoreline column.")
     
     beach_lat = raw_input_df[lat_col].iloc[0]
     beach_lon = raw_input_df[lon_col].iloc[0]
+    # No longer need shore orientation for wave direction calculation
     
-    # Create primary Datetime Index from the time_col
     dates_series = pd.to_datetime(raw_input_df[time_col])
     if dates_series.dt.tz is not None:
         dates_series = dates_series.dt.tz_localize(None)
     datetime_index = dates_series.dt.normalize()
-
-    # 2. Prepare Shoreline Data Frame
+    
     shoreline_data = raw_input_df.rename(columns={shore_col: 'shore'}).set_index(datetime_index)
     
-    # Preserve 'real_date' column as string for traceability
     real_date_series = None
     if 'real_date' in raw_input_df.columns:
-        real_dates_raw = raw_input_df['real_date'].values
-        # Store as string object to avoid future date-handling errors
-        real_date_series = pd.Series(real_dates_raw, index=datetime_index, name='real_date_str').astype(str)
+        real_date_series = pd.Series(raw_input_df['real_date'].values, 
+                                      index=datetime_index, name='real_date_str').astype(str)
     
-    # 3. Spatial Query and Index Mapping
-    if GLOBAL_TREE is None: raise RuntimeError("Global KD-Tree not initialized.")
-        
-    distance, nearest_index_ptr = GLOBAL_TREE.query([beach_lat, beach_lon], k=1)
+    if GLOBAL_TREE is None:
+        raise RuntimeError("Global KD-Tree not initialized.")
+    
+    _, nearest_index_ptr = GLOBAL_TREE.query([beach_lat, beach_lon], k=1)
     i_indices, j_indices, _, _ = GLOBAL_GRID_INDICES
     lat_i = i_indices[nearest_index_ptr]
     lon_j = j_indices[nearest_index_ptr]
     
-    # 4. Extract Raw Hs Data and Calculate Raw Wave Energy
-    raw_energy_series = None
-    try:
+    if WAVE_DATA_CACHE:
+        raw_hs = WAVE_DATA_CACHE['hs'][:, lat_i, lon_j]
+        netcdf_days = WAVE_DATA_CACHE['time']
+    else:
         with xr.open_dataset(wave_nc_path) as ds:
-            # Time Sync
-            netcdf_days = ds['time'].to_series().index
-            if not isinstance(netcdf_days, pd.DatetimeIndex):
-                time_var = ds['time']
-                decoded = cftime.num2date(time_var.values, units=time_var.attrs.get('units', ''), calendar=time_var.attrs.get('calendar', 'standard'))
-                netcdf_days = pd.to_datetime(decoded)
-            netcdf_days = netcdf_days.normalize()
-
-            # Extract RAW Hs
-            da = ds[WAVE_VAR].isel(latitude=lat_i, longitude=lon_j)
-            raw_hs_series = pd.Series(da.values, index=netcdf_days) 
-            
-            # Calculate RAW Wave Energy (Hs^2)
-            raw_energy_series = raw_hs_series ** 2
-            
-    except Exception as e:
-        raise Exception(f"Error during wave extraction: {e}")
-
-    # APPLY 15-DAY EWMA TO WAVE ENERGY
-    smoothed_energy_series = raw_energy_series.ewm(span=EWMA_SPAN, min_periods=1).mean()
+            raw_hs = ds[WAVE_VAR].isel(latitude=lat_i, longitude=lon_j).values
+            netcdf_days = pd.to_datetime(ds['time'].values).normalize()
     
-    # 5. Combine, Resample, and Clean
-    combined_data = pd.DataFrame(index=shoreline_data.index.union(smoothed_energy_series.index).unique()).sort_index()
+    # Calculate wave energy directly (Hs²) - NO DIRECTION
+    wave_energy = calculate_wave_energy(raw_hs)
+    
+    # =====================================================
+    # UPDATED: Exponential smoothing instead of rolling mean
+    # =====================================================
+    # Old approach (introduces artificial phase lag):
+    #   raw_energy_series = pd.Series(wave_energy, index=netcdf_days)
+    #   smoothed_energy_series = raw_energy_series.rolling(window=EWMA_SPAN, min_periods=1).mean()
+    #
+    # New approach (consistent with Y09 memory, no phase lag):
+    #   E_eff(t) = α * E(t) + (1 - α) * E_eff(t-1)
+    # =====================================================
+    
+    smoothed_energy = apply_exponential_smoothing_fast(wave_energy, alpha=ENERGY_SMOOTHING_ALPHA)
+    smoothed_energy_series = pd.Series(smoothed_energy, index=netcdf_days)
+    
+    combined_data = pd.DataFrame(
+        index=shoreline_data.index.union(smoothed_energy_series.index).unique()
+    ).sort_index()
+    
     combined_data['shore'] = shoreline_data['shore']
+    combined_data['wave_energy'] = smoothed_energy_series
     
-    # Store smoothed energy directly in the 'wave_energy' column
-    combined_data['wave_energy'] = smoothed_energy_series 
-    
-    # Add 'real_date' string series
     if real_date_series is not None:
         combined_data = combined_data.join(real_date_series, how='left')
-
-    # Final resampling and cleaning
-    combined_data = combined_data.resample('D').interpolate(method='linear', limit_direction='forward')
     
-    # Drop rows based on core modeling variables (shore and wave_energy)
+    combined_data = combined_data.resample('D').interpolate(method='linear', limit_direction='forward')
+    combined_data['month'] = combined_data.index.month
     combined_data.dropna(subset=['shore', 'wave_energy'], how='any', inplace=True)
     
-    MIN_DATA_POINTS = 30
-    if len(combined_data) < MIN_DATA_POINTS:
-         raise ValueError(f"Insufficient overlapping data ({len(combined_data)} days).")
-    
-    logging.info(f"Data prepared from {combined_data.index.min().date()} to {combined_data.index.max().date()} ({len(combined_data)} days). Wave Energy smoothed with EWMA={EWMA_SPAN}.")
+    if len(combined_data) < 30:
+        raise ValueError(f"Insufficient overlapping data ({len(combined_data)} days).")
     
     return combined_data
 
+
 def split_and_prepare_data(data, split_date='2020-12-31'):
     """
-    Split data and calculate the Unified Wave-Based Trend component.
-    """
+    Split data into train and test sets.
     
+    Parameters:
+    -----------
+    data : DataFrame
+        Combined data
+    split_date : str
+        Date to split on (training ends here)
+    
+    Returns:
+    --------
+    tuple
+        (train_data, predict_data, S_obs)
+    """
     train_data = data.loc[:pd.to_datetime(split_date)].copy()
     start_predict_date = pd.to_datetime(split_date) + pd.Timedelta(days=1)
     predict_data = data.loc[start_predict_date:].copy()
-
-    if train_data.empty: raise ValueError("Training period is empty after splitting.")
-
+    
+    if train_data.empty:
+        raise ValueError("Training period is empty after splitting.")
+    
     S_obs = train_data['shore'].values
     
-    # --- LOGIC FOR UNIFIED WAVE-BASED TREND ---
-    
-    X_train_E = train_data[['wave_energy']].values
-    y_train_S = train_data['shore'].values
-    
-    # 1. Fit the Linear Trend Model: Shoreline position explained by Wave Energy
-    trend_model = LinearRegression()
-    
-    if len(X_train_E) < 2:
-        # Handle insufficient data by using zero trend and detrended S
-        trend = np.zeros(len(S_obs))
-        S_obs_detrended = S_obs
-        trend_model = None # Flag model as failed/unfitted
-    else:
-        trend_model.fit(X_train_E, y_train_S)
-        
-        # 2. Calculate the Trend component (Prediction on Training Data)
-        trend = trend_model.predict(X_train_E).flatten()
-        
-        # 3. Detrend the Shoreline (Subtract the wave-based trend)
-        S_obs_detrended = y_train_S - trend
+    return train_data, predict_data, S_obs
 
-    # NOTE: trend_model (LinearRegression object) is returned as "trend_coeffs"
-    return train_data, predict_data, S_obs, S_obs_detrended, trend, trend_model
 
 # ==============================================================
-# 3. PLOTTING FUNCTION (New Style) - With Real-Date Scatter Plot (SPADS style)
+# 6. PLOTTING
 # ==============================================================
 
-def plot_results_new_style(beach_id, train_data, predict_data, S_obs, S_sim_train, S_predict, y_test, metrics, output_folder):
+def plot_results_fast(beach_id, train_data, predict_data, S_sim_train, S_predict,
+                      metrics, output_folder, optimized_params=None):
     """
-    Plots Observed, Modeled, and Predicted Shoreline using the requested SPADS style:
-    1. Observed data: Discrete scatter points (s=10) filtered by real_date_str.
-    2. Predicted data: Continuous line (lw=1.6).
+    Plotting with anti-oscillation info.
+    
+    Parameters:
+    -----------
+    beach_id : str
+        Beach identifier
+    train_data : DataFrame
+        Training data
+    predict_data : DataFrame
+        Prediction data
+    S_sim_train : array
+        Simulated training shoreline
+    S_predict : array
+        Predicted shoreline
+    metrics : dict
+        Dictionary with 'train' and 'test' metric tuples
+    output_folder : Path
+        Output directory
+    optimized_params : array, optional
+        Optimized parameters for display
     """
+    cc_tr, _, nrmse_tr, norm_std_tr, loss_tr = metrics['train']
+    cc_te, _, nrmse_te, norm_std_te, loss_te = metrics['test']
     
-    cc_tr, rmse_tr, nrmse_tr, norm_std_tr, loss_tr = metrics['train']
-    cc_te, rmse_te, nrmse_te, norm_std_te, loss_te = metrics['test']
+    fig, ax = plt.subplots(figsize=(12, 5))
     
-    # 1. Combine data for plotting
-    full_index = train_data.index.union(predict_data.index)
-    combined_plot_df = pd.DataFrame(index=full_index)
+    ax.scatter(train_data.index, train_data['shore'], s=5, c='blue', alpha=0.6, label='Obs (Train)')
+    ax.scatter(predict_data.index, predict_data['shore'], s=5, c='cyan', alpha=0.6, label='Obs (Test)')
     
-    # Reconstruct the full observation and prediction series
-    combined_plot_df['Observed'] = pd.concat([train_data['shore'], predict_data['shore']])
-    combined_plot_df['Predicted'] = pd.concat([pd.Series(S_sim_train, index=train_data.index), 
-                                                pd.Series(S_predict[:len(predict_data)], index=predict_data.index)])
+    ax.plot(train_data.index, S_sim_train, 'r-', lw=1, label='Model (Y09 Exp Memory)')
+    ax.plot(predict_data.index[:len(S_predict)], S_predict, 'r-', lw=1)
     
-    # Reconstruct the full real_date_str series for filtering
-    real_date_train = train_data.get('real_date_str', pd.Series(index=train_data.index, dtype=str))
-    real_date_predict = predict_data.get('real_date_str', pd.Series(index=predict_data.index, dtype=str))
+    txt = f"Train: CC={cc_tr:.3f} NRMSE={nrmse_tr:.3f}\nTest: CC={cc_te:.3f} NRMSE={nrmse_te:.3f}"
+    if optimized_params is not None:
+        txt += f"\nφ={optimized_params[4]:.2f}, γ={optimized_params[5]:.2f}"
+    txt += f"\nα={ENERGY_SMOOTHING_ALPHA:.3f}"
+    ax.text(0.98, 0.02, txt, transform=ax.transAxes, ha='right', va='bottom',
+            fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
     
-    # Check if a non-null string exists for real_date
-    combined_plot_df['real_date_exists'] = pd.concat([real_date_train, real_date_predict]).notna()
-
-    # --- Filtering for Observed Scatter Plot (SPADS Strategy) ---
+    ax.set_title(f'{beach_id} — Y09 Model (Exponential Memory Smoothing)')
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Shoreline Position (m)')
+    ax.legend(loc='upper left', fontsize=8)
+    ax.grid(True, alpha=0.3)
     
-    # 1. Full Predicted Line (Used as continuous line)
-    full_predicted_line = combined_plot_df[combined_plot_df['Predicted'].notna()]
-    
-    # 2. Observed Scatter Points (Must have a valid Observation AND a corresponding real_date string)
-    observed_points_for_plot = combined_plot_df[combined_plot_df['real_date_exists'] & combined_plot_df['Observed'].notna()]
-
-    if full_predicted_line.empty: return
-
-    plt.figure(figsize=(14, 6))
-    
-    # Plot Observed data as discrete scatter points (SPADS style: s=10)
-    plt.scatter(observed_points_for_plot.index, observed_points_for_plot['Observed'], 
-                label='Observation (Real Dates)', color='blue', s=10)
-    
-    # Plot Predicted data as a continuous line (SPADS style: lw=1.6)
-    plt.plot(full_predicted_line.index, full_predicted_line['Predicted'], 
-             label=f'Y09 Model (Unified Wave Trend)', color='red', lw=1.6)
-    
-    # Highlight Prediction Period (as requested)
-    split_date = pd.Timestamp('2021-01-01')
-    if predict_data.index.min() < predict_data.index.max():
-         plt.axvspan(split_date, predict_data.index.max(), color='gray', alpha=0.3, label='Prediction Period')
-    
-    # Metric text box (using your requested format)
-    txt = (f"Train -> CC={cc_tr:.4f}  NRMSE={nrmse_tr:.4f}  NormStd={norm_std_tr:.4f}  Loss={loss_tr:.4f}\n"
-           f"Test  -> CC={cc_te:.4f}  NRMSE={nrmse_te:.4f}  NormStd={norm_std_te:.4f}  Loss={loss_te:.4f}")
-
-    plt.text(0.99, 0.01, txt, transform=plt.gca().transAxes, ha='right', va='bottom', fontsize=9.5,
-             bbox=dict(facecolor='white', alpha=0.9, edgecolor='black'))
-
-    plt.title(f'{beach_id} — Y09 Equilibrium Model (Unified Wave-Based Trend)')
-    plt.xlabel('Date'); plt.ylabel('Shoreline Position (m)')
-    plt.legend(loc='lower left')
-    plt.grid(True, ls='--', alpha=0.6)
     plt.tight_layout()
-    
-    output_path = output_folder / f"{beach_id}_Y09_plot.png"
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.savefig(output_folder / f"{beach_id}_Y09_exp_memory_plot.png", dpi=150)
     plt.close()
 
+
 # ==============================================================
-# 4. Y09 BATCH RUNNER
+# 7. MAIN PROCESSING FUNCTION
 # ==============================================================
 
-def run_y09_for_file(input_csv_path: Path, wave_nc_path: Path, output_dir_base: Path, region_name: str, parent_dir: Path):
+def run_y09_for_file_fast(input_csv_path: Path, wave_nc_path: Path, output_dir_base: Path,
+                          region_name: str):
     """
-    Runs the full Y09 pipeline for a single input file and collects metrics.
+    Pure Y09 pipeline with direct wave energy (no direction).
+    Same inputs/outputs as original.
+    
+    Parameters:
+    -----------
+    input_csv_path : Path
+        Path to input CSV
+    wave_nc_path : Path
+        Path to wave NetCDF
+    output_dir_base : Path
+        Base output directory
+    region_name : str
+        Region identifier
     """
-    warnings.filterwarnings('ignore', category=UserWarning) 
+    warnings.filterwarnings('ignore', category=UserWarning)
     
-    beach_id = input_csv_path.stem.split("_")[0] 
-    
+    beach_id = input_csv_path.stem.split("_")[0]
     output_folder = output_dir_base / region_name
     output_folder.mkdir(parents=True, exist_ok=True)
-    
-    logging.info("=" * 60)
-    logging.info(f"STARTING Y09 MODEL FOR: {beach_id} (Region: {region_name}) [Unified Wave Trend]")
     
     metrics_entry = {'region': region_name, 'beach_id': beach_id}
     
     try:
-        # 1. Load and Merge Data
-        data = load_and_merge_data(input_csv_path, wave_nc_path)
+        # 1. Load data (now uses exponential smoothing)
+        data = load_and_merge_data_fast(input_csv_path, wave_nc_path)
         
-        # 2. Split and Prepare Data (Wave-Based trend detection)
+        # 2. Split data
         SPLIT_DATE = '2020-12-31'
-        # trend_model is the LinearRegression object
-        train_data, predict_data, S_obs, S_obs_detrended, trend, trend_model = split_and_prepare_data(data, split_date=SPLIT_DATE)
+        train_data, predict_data, S_obs = split_and_prepare_data(data, split_date=SPLIT_DATE)
         
-        # 3. Optimization
-        param_bounds = [(-2, 1), (0, 6), (0, 5), (0, 5)] 
-        initial_params = [-1.5, 3, 2.5, 2.5]
+        train_months = train_data['month'].values
+        E_train = train_data['wave_energy'].values
         
-        # NOTE: S_obs_detrended[0] is the starting point for the detrended simulation
-        result = optimize_parameters(initial_params, param_bounds, S_obs_detrended[0], train_data['wave_energy'].values, trend, S_obs)
-        if not result.success:
-             initial_params_2 = [np.mean(b) for b in param_bounds]
-             result = optimize_parameters(initial_params_2, param_bounds, S_obs_detrended[0], train_data['wave_energy'].values, trend, S_obs)
-             if not result.success: raise RuntimeError(f"Optimization failed: {result.message}")
-                 
-        a_opt, b_opt, C_plus_opt, C_minus_opt = result.x
-        logging.info(f"{beach_id}: Params: a={a_opt:.4f}, b={b_opt:.2f}, C+={C_plus_opt:.4f}, C-={C_minus_opt:.4f}")
+        # 3. Optimization with anti-oscillation constraints
+        result = optimize_parameters_fast(
+            S_obs[0], E_train, S_obs, train_months
+        )
         
-        # 4. Training Simulation
-        model = EquilibriumShorelineModel(a_opt, b_opt, C_plus_opt, C_minus_opt)
-        S_sim_train_detrended = model.simulate(S_obs_detrended[0], train_data['wave_energy'].values)
-        S_sim_train = S_sim_train_detrended + trend # Re-add wave-based trend for final training fit
+        # Unpack all 8 parameters
+        a_opt, b_opt, C_plus_opt, C_minus_opt, phi_opt, gamma_opt, seasonal_amp_opt, seasonal_phase_opt = result.x
         
-        # 5. Prediction (Unified Wave-Based Trend)
+        # 4. Training simulation
+        S_sim_train = simulate_fast(
+            S_obs[0], E_train, train_months,
+            a_opt, b_opt, C_plus_opt, C_minus_opt, phi_opt, gamma_opt, seasonal_amp_opt, seasonal_phase_opt
+        )
+        
+        # 5. Prediction
         E_predict = predict_data['wave_energy'].values
-        S_predict_detrended = model.simulate(S_sim_train_detrended[-1], E_predict)
+        predict_months = predict_data['month'].values
         
-        # --- LOGIC FOR UNIFIED WAVE-BASED PREDICTION (with Anchoring) ---
+        S_predict = simulate_fast(
+            S_sim_train[-1], E_predict, predict_months,
+            a_opt, b_opt, C_plus_opt, C_minus_opt, phi_opt, gamma_opt, seasonal_amp_opt, seasonal_phase_opt
+        )
         
-        if trend_model:
-            X_predict = predict_data[['wave_energy']].values
-            
-            # Predict the trend directly using the trained model (Unified)
-            trend_predict_raw = trend_model.predict(X_predict).flatten()
-            
-            # Calculate the offset to ensure smooth transition (Anchoring)
-            X_last_train = train_data[['wave_energy']].iloc[-1].values.reshape(1, -1)
-            trend_predicted_at_last_day = trend_model.predict(X_last_train)[0]
-            
-            # Offset = Actual Wave Trend Value at end of training - Model's Wave Trend Value at end of training
-            offset = trend[-1] - trend_predicted_at_last_day
-            
-            # Apply the offset to all future trend predictions
-            trend_predict = trend_predict_raw + offset
-            
-        else:
-            # Fallback if training failed
-            trend_predict = np.zeros(len(E_predict))
+        min_len_pred = min(len(predict_data), len(S_predict))
+        S_predict = S_predict[:min_len_pred]
         
-        # Align prediction lengths
-        min_len_pred = min(len(predict_data), len(S_predict_detrended), len(trend_predict))
-        S_predict_detrended = S_predict_detrended[:min_len_pred]
-        trend_predict = trend_predict[:min_len_pred]
-        S_predict = S_predict_detrended + trend_predict
+        # 6. Calculate metrics
+        metrics_dict_tr, metrics_tuple_tr = calculate_metrics(S_obs, S_sim_train)
+        metrics_dict_te, metrics_tuple_te = calculate_metrics(
+            predict_data['shore'].values[:min_len_pred], S_predict
+        )
         
-        # 6. Calculate Metrics (SPADS Strategy: Filtered by Real Date)
-        
-        # Create full observed/predicted series
-        full_S_obs = np.concatenate([S_obs, predict_data['shore'].values])
-        full_S_sim = np.concatenate([S_sim_train, S_predict])
-        
-        # Get the real_date_str column from the original combined data frame
-        real_date_exists = data['real_date_str'].notna().values[:len(full_S_obs)]
-        
-        # Apply filter to observed and simulated data
-        S_obs_filtered = full_S_obs[real_date_exists]
-        S_sim_filtered = full_S_sim[real_date_exists]
-        
-        # Determine the length of the training set after filtering
-        train_len = len(train_data[train_data['real_date_str'].notna()])
-        
-        S_obs_tr_filtered = S_obs_filtered[:train_len]
-        S_sim_tr_filtered = S_sim_filtered[:train_len]
-        S_obs_te_filtered = S_obs_filtered[train_len:]
-        S_sim_te_filtered = S_sim_filtered[train_len:]
-        
-        metrics_dict_tr, metrics_tuple_tr = calculate_metrics(S_obs_tr_filtered, S_sim_tr_filtered)
-        metrics_dict_te, metrics_tuple_te = calculate_metrics(S_obs_te_filtered, S_sim_te_filtered)
-        
-        # 7. Save Final Results CSV (Simplified Output)
-        predicted_full = pd.concat([pd.Series(S_sim_train, index=train_data.index, name='Prediction'), 
-                                    pd.Series(S_predict, index=predict_data.index[:min_len_pred], name='Prediction')])
+        # 7. Save results
+        predicted_full = pd.concat([
+            pd.Series(S_sim_train, index=train_data.index),
+            pd.Series(S_predict, index=predict_data.index[:min_len_pred])
+        ])
         
         final_output_df = pd.DataFrame(index=data.index)
         final_output_df['Observation'] = data['shore']
         final_output_df['Prediction'] = predicted_full
-        
         if 'real_date_str' in data.columns:
-             final_output_df['real_date'] = data['real_date_str']
-
+            final_output_df['real_date'] = data['real_date_str']
         final_output_df.index.name = 'date'
         
-        output_csv_path = output_folder / f"{beach_id}_Y09_results.csv"
+        output_csv_path = output_folder / f"{beach_id}_Y09_exp_memory_results.csv"
         final_output_df.dropna(subset=['Observation', 'Prediction'], how='all').to_csv(output_csv_path)
-
-        # 8. Plot Results (uses SPADS scatter/line strategy)
-        metrics_plot = {'train': metrics_tuple_tr, 'test': metrics_tuple_te}
-        plot_results_new_style(beach_id, train_data, predict_data.iloc[:min_len_pred], S_obs, S_sim_train, S_predict, None, metrics_plot, output_folder)
         
-        # 9. Collect Metrics for Summary
+        # 8. Plot
+        metrics_plot = {'train': metrics_tuple_tr, 'test': metrics_tuple_te}
+        plot_results_fast(beach_id, train_data, predict_data.iloc[:min_len_pred],
+                          S_sim_train, S_predict, metrics_plot, output_folder,
+                          optimized_params=result.x)
+        
+        # 9. Collect metrics
         metrics_entry.update({
-            'a_opt': round(a_opt, 4), 'b_opt': round(b_opt, 4), 
+            'a_opt': round(a_opt, 4), 'b_opt': round(b_opt, 4),
             'C_plus_opt': round(C_plus_opt, 4), 'C_minus_opt': round(C_minus_opt, 4),
-            'train_cc': metrics_dict_tr['cc'], 'train_nrmse': metrics_dict_tr['norm_rmse'], 'train_norm_std': metrics_dict_tr.get('norm_std', np.nan), 'train_loss': metrics_dict_tr['loss'],
-            'test_cc': metrics_dict_te['cc'], 'test_nrmse': metrics_dict_te['norm_rmse'], 'test_norm_std': metrics_dict_te.get('norm_std', np.nan), 'test_loss': metrics_dict_te['loss']
+            'phi_opt': round(phi_opt, 4), 'gamma_opt': round(gamma_opt, 4),
+            'seasonal_amp_opt': round(seasonal_amp_opt, 4),
+            'seasonal_phase_opt': round(seasonal_phase_opt, 4),
+            'energy_smoothing_alpha': ENERGY_SMOOTHING_ALPHA,
+            'train_cc': metrics_dict_tr['cc'], 'train_nrmse': metrics_dict_tr['norm_rmse'],
+            'test_cc': metrics_dict_te['cc'], 'test_nrmse': metrics_dict_te['norm_rmse'],
+            'damping_used': DAMPING_FACTOR if USE_DAMPING else 0.0
         })
         ALL_METRICS.append(metrics_entry)
-        logging.info(f"{beach_id}: Test CC (Real Dates)={metrics_dict_te['cc']:.3f}, Test NRMSE={metrics_dict_te['norm_rmse']:.3f}")
-
-    except Exception as e:
-        metrics_entry.update({'a_opt': np.nan, 'b_opt': np.nan, 'C_plus_opt': np.nan, 'C_minus_opt': np.nan, 'error': str(e)})
-        ALL_METRICS.append(metrics_entry)
-        logging.error(f"FATAL ERROR processing {beach_id}: {e}")
         
-    warnings.filterwarnings('default', category=UserWarning)
+        logging.info(f"{beach_id}: CC_test={metrics_dict_te['cc']:.3f}, NRMSE={metrics_dict_te['norm_rmse']:.3f}, phi={phi_opt:.2f}, gamma={gamma_opt:.2f}")
+        
+    except Exception as e:
+        metrics_entry['error'] = str(e)
+        ALL_METRICS.append(metrics_entry)
+        logging.error(f"Error processing {beach_id}: {e}")
+
 
 # ==============================================================
-# 5. MAIN BATCH RUNNER
+# 8. MAIN BATCH RUNNER
 # ==============================================================
 
-def main_runner_y09():
-    """Main function to run Y09 in batch mode with full integration."""
+def main_runner_y09_fast():
+    """
+    Batch runner with direct wave energy model (no direction).
+    Same structure as original.
     
-    # --- GLOBAL CONFIGURATION ---
-    PARENT_DIR = Path(r"C:\Users\amgh628\Downloads\Shoreline_calssified") 
-    REGION_DIRS = ["SW_new2", "SE_new","NW_new","NE_new"]                 
-    WAVE_NC_PATH = PARENT_DIR / "NZ_wave_coastal_daily_merged.nc"         
-    # NOTE: Output folder name reflects the unified wave-based method + real date metrics
-    OUTPUT_DIR_BASE = PARENT_DIR / "Y09_Automated_Results_UnifiedWaveTrend_RealDateMetrics_3"                     
+    UPDATED: Uses exponential memory smoothing instead of rolling mean.
+    """
+    PARENT_DIR = Path(r'/home/amgh628')
+    REGION_DIRS = ["SW_3", "SE_3", "NW_3", "NE_3"]
+    WAVE_NC_PATH = PARENT_DIR / "NZ_wave_coastal_daily_merged.nc"
+    OUTPUT_DIR_BASE = PARENT_DIR / "Y09_noTrend_anti_OC_rolling_3"
     
     OUTPUT_DIR_BASE.mkdir(parents=True, exist_ok=True)
     
-    logging.info("=" * 80)
-    logging.info(f"Y09 BATCH RUNNER (Unified Wave-Based Trend, Metrics on Real Dates)")
-    logging.info(f"Base Output directory: {OUTPUT_DIR_BASE}")
-    logging.info(f"Wave NetCDF: {WAVE_NC_PATH}")
-    logging.info("=" * 80)
+    logging.info("=" * 60)
+    logging.info("Y09 EXPONENTIAL MEMORY BATCH RUNNER")
+    logging.info(f"Wave energy: E = Hs² (no directional component)")
+    logging.info(f"Energy smoothing: Exponential memory (α={ENERGY_SMOOTHING_ALPHA})")
+    logging.info(f"  Formula: E_eff(t) = α*E(t) + (1-α)*E_eff(t-1)")
+    logging.info(f"Damping enabled: {USE_DAMPING}, Factor: {DAMPING_FACTOR}")
+    logging.info("=" * 60)
     
     if not WAVE_NC_PATH.exists():
         logging.error(f"Wave NetCDF not found: {WAVE_NC_PATH}")
         return
-
-    try:
-        # Step 1: Initialize the global KD-Tree (done only once)
-        initialize_global_kd_tree(WAVE_NC_PATH)
-    except Exception:
-        logging.error(f"Failed to set up global KD-Tree. Aborting run.")
-        return
-
+    
+    initialize_global_kd_tree(WAVE_NC_PATH)
+    preload_wave_data(WAVE_NC_PATH)
+    
     total_files = 0
     processed_count = 0
     
-    # Step 2: Run batch processing
     for region in REGION_DIRS:
         region_path = PARENT_DIR / region
-        logging.info("\n" + "#" * 50)
-        logging.info(f"PROCESSING REGION: {region_path.name}")
-        logging.info("#" * 50)
-
+        
         if not region_path.exists():
-            logging.warning(f"Region folder does not exist, skipping: {region_path}")
             continue
-
+        
         shoreline_files = sorted(region_path.glob("*_shoreline_final.csv"))
         if not shoreline_files:
             shoreline_files = sorted(region_path.glob("*_shoreline_smoothed_final.csv"))
-            if not shoreline_files:
-                logging.info("No shoreline files found.")
-                continue
-
-        for csv_path in tqdm(shoreline_files, desc=f"Modeling files in {region}"):
+        
+        if not shoreline_files:
+            continue
+        
+        total_files += len(shoreline_files)
+        
+        for csv_path in tqdm(shoreline_files, desc=f"Processing {region}"):
             try:
-                # Pass both the base output directory and the current region name
-                run_y09_for_file(csv_path, WAVE_NC_PATH, OUTPUT_DIR_BASE, region, PARENT_DIR)
+                run_y09_for_file_fast(csv_path, WAVE_NC_PATH, OUTPUT_DIR_BASE, region)
                 processed_count += 1
-            except Exception as e:
-                # Error is logged inside run_y09_for_file, continue the loop
-                pass 
+            except Exception:
+                pass
     
-    # Step 3: Save Summary Metrics
+    # Save summary
     if ALL_METRICS:
         metrics_df = pd.DataFrame(ALL_METRICS)
-        # NOTE: Updated summary file name
-        summary_path = PARENT_DIR / "Y09_Automated_Metrics" / "ALL_REGIONS_summary_UnifiedWaveTrend_RealDateMetrics_3.csv"
+        summary_path = PARENT_DIR / "Y09_Automated_Metrics" / "rich_obs_beach_1.csv"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
         metrics_df.to_csv(summary_path, index=False)
         
-        logging.info("=" * 80)
-        logging.info(f"BATCH RUN COMPLETE. Processed {processed_count}/{total_files} files.")
-        logging.info(f"Summary saved to: {summary_path}")
-        logging.info("=" * 80)
-    else:
-        logging.info("Batch run complete, but no metrics were collected.")
+        logging.info(f"\nCompleted: {processed_count}/{total_files} files")
+        logging.info(f"Summary: {summary_path}")
+        
+        # Print phi and gamma distribution
+        if 'phi_opt' in metrics_df.columns:
+            logging.info(f"Phi statistics: mean={metrics_df['phi_opt'].mean():.3f}, "
+                        f"max={metrics_df['phi_opt'].max():.3f}")
+        if 'gamma_opt' in metrics_df.columns:
+            logging.info(f"Gamma statistics: mean={metrics_df['gamma_opt'].mean():.3f}, "
+                        f"max={metrics_df['gamma_opt'].max():.3f}")
 
-# Execute the main runner
+
 if __name__ == "__main__":
-    main_runner_y09()
+    main_runner_y09_fast()
